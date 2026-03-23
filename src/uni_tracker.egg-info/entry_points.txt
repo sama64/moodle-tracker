@@ -1,0 +1,2 @@
+[console_scripts]
+uni-tracker-worker = uni_tracker.worker:main

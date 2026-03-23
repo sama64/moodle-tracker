@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: uni_tracker
+      POSTGRES_USER: uni_tracker
+      POSTGRES_PASSWORD: uni_tracker
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app/src
+    volumes:
+      - ./artifacts:/app/artifacts
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    command: >
+      bash -lc "alembic upgrade head &&
+      uvicorn uni_tracker.main:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app/src
+    volumes:
+      - ./artifacts:/app/artifacts
+    depends_on:
+      - db
+    command: >
+      bash -lc "alembic upgrade head &&
+      python -m uni_tracker.worker"
+
+volumes:
+  postgres-data:
