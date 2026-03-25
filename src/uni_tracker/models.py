@@ -147,6 +147,7 @@ class NormalizedItem(TimestampMixin, Base):
     source_object: Mapped["SourceObject"] = relationship(back_populates="normalized_items")
     versions: Mapped[list["ItemVersion"]] = relationship(back_populates="normalized_item")
     facts: Mapped[list["ItemFact"]] = relationship(back_populates="normalized_item")
+    brief: Mapped["ItemBrief | None"] = relationship(back_populates="normalized_item", uselist=False)
     llm_jobs: Mapped[list["LLMJob"]] = relationship(back_populates="normalized_item")
 
 
@@ -179,6 +180,35 @@ class ItemFact(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     normalized_item: Mapped["NormalizedItem"] = relationship(back_populates="facts")
+
+
+class ItemBrief(Base):
+    __tablename__ = "item_briefs"
+    __table_args__ = (UniqueConstraint("normalized_item_id", name="uq_item_briefs_normalized_item"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    normalized_item_id: Mapped[int] = mapped_column(ForeignKey("normalized_items.id"))
+    source_artifact_id: Mapped[int | None] = mapped_column(ForeignKey("raw_artifacts.id"), nullable=True)
+    llm_job_id: Mapped[int | None] = mapped_column(ForeignKey("llm_jobs.id"), nullable=True)
+    origin: Mapped[str] = mapped_column(String(50), default="stored")
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    summary_short: Mapped[str] = mapped_column(Text)
+    summary_bullets: Mapped[list[Any]] = mapped_column(JSON)
+    key_dates: Mapped[list[Any]] = mapped_column(JSON)
+    key_requirements: Mapped[list[Any]] = mapped_column(JSON)
+    risk_flags: Mapped[list[Any]] = mapped_column(JSON)
+    course_context: Mapped[dict[str, Any]] = mapped_column(JSON)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    source_refs: Mapped[list[Any]] = mapped_column(JSON)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    normalized_item: Mapped["NormalizedItem"] = relationship(back_populates="brief")
+    llm_job: Mapped["LLMJob | None"] = relationship(foreign_keys=lambda: [ItemBrief.llm_job_id])
 
 
 class Notification(Base):

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from uni_tracker.config import get_settings
 from uni_tracker.models import ItemFact, LLMJob, NormalizedItem
+from uni_tracker.services.briefs import upsert_item_brief
 
 
 class LLMUnavailable(RuntimeError):
@@ -50,16 +51,20 @@ def enrich_recent_items(session: Session, limit: int = 10) -> dict[str, int]:
     processed = 0
     with build_nvidia_client() as client:
         for item in items:
-            if any(job.job_type == "summary" and job.status == "completed" for job in item.llm_jobs):
+            if item.brief is not None:
                 continue
             truncated_body = _truncate_body(item.body_text or "", settings.llm_body_char_limit)
             prompt = (
-                "You are extracting academic risk information from Moodle material.\n"
-                "Return JSON only with keys summary, dates, urgent_signals.\n"
-                "summary must be a short Spanish summary.\n"
-                "dates must be an array of objects with keys type, iso_datetime, matched_text.\n"
-                "Use null iso_datetime if ambiguous.\n"
-                "urgent_signals must be an array of short strings.\n\n"
+                "You are compressing Moodle content into a compact agent brief.\n"
+                "Return JSON only with keys summary_short, summary_bullets, key_dates, key_requirements, risk_flags, course_context, confidence, source_refs.\n"
+                "summary_short must be a short Spanish summary.\n"
+                "summary_bullets must be a short array of Spanish bullet fragments.\n"
+                "key_dates must be an array of objects with keys type, iso_datetime, matched_text.\n"
+                "key_requirements must be an array of short strings.\n"
+                "risk_flags must be an array of short strings.\n"
+                "course_context must be a small object describing the course/item context.\n"
+                "source_refs must be an array of compact references to the source.\n"
+                "Use null iso_datetime if ambiguous.\n\n"
                 f"Title: {item.title}\n"
                 f"Body:\n{truncated_body}\n"
             )
@@ -95,19 +100,19 @@ def enrich_recent_items(session: Session, limit: int = 10) -> dict[str, int]:
                 job.response_payload = payload
                 job.output_text = message
                 job.finished_at = datetime.now(UTC)
-                summary = parsed.get("summary") or message
+                brief_payload = _build_brief_payload(item, parsed, message)
                 session.add(
                     ItemFact(
                         normalized_item_id=item.id,
                         source_artifact_id=None,
                         fact_type="llm_summary",
-                        value_json={"summary": summary},
+                        value_json={"summary": brief_payload["summary_short"]},
                         confidence=0.5,
                         extractor_type="llm_kimi_k2_5",
                         source_span=item.title,
                     )
                 )
-                for date_fact in parsed.get("dates", []):
+                for date_fact in parsed.get("key_dates") or parsed.get("dates") or []:
                     iso_datetime = date_fact.get("iso_datetime")
                     if not iso_datetime:
                         continue
@@ -125,18 +130,27 @@ def enrich_recent_items(session: Session, limit: int = 10) -> dict[str, int]:
                             source_span=date_fact.get("matched_text"),
                         )
                     )
-                if parsed.get("urgent_signals"):
+                risk_flags = parsed.get("risk_flags") or parsed.get("urgent_signals") or []
+                if risk_flags:
                     session.add(
                         ItemFact(
                             normalized_item_id=item.id,
                             source_artifact_id=None,
                             fact_type="llm_urgent_signals",
-                            value_json={"signals": parsed["urgent_signals"]},
+                            value_json={"signals": risk_flags},
                             confidence=0.45,
                             extractor_type="llm_kimi_k2_5",
                             source_span=item.title,
                         )
                     )
+                upsert_item_brief(
+                    session,
+                    item=item,
+                    payload=brief_payload,
+                    model=settings.nvidia_model,
+                    llm_job_id=job.id,
+                    source_artifact_id=None,
+                )
                 processed += 1
             except Exception as exc:
                 job.status = "failed"
@@ -162,6 +176,46 @@ def _parse_llm_payload(message: str) -> dict[str, Any]:
     parsed.setdefault("dates", [])
     parsed.setdefault("urgent_signals", [])
     return parsed
+
+
+def _build_brief_payload(item: NormalizedItem, parsed: dict[str, Any], message: str) -> dict[str, Any]:
+    summary_short = parsed.get("summary_short") or parsed.get("summary") or message or item.title
+    summary_bullets = parsed.get("summary_bullets") or []
+    if isinstance(summary_bullets, str):
+        summary_bullets = [summary_bullets]
+    key_dates = parsed.get("key_dates") or parsed.get("dates") or []
+    key_requirements = parsed.get("key_requirements") or []
+    risk_flags = parsed.get("risk_flags") or parsed.get("urgent_signals") or []
+    course_context = parsed.get("course_context") or {}
+    if not isinstance(course_context, dict):
+        course_context = {}
+    source_refs = parsed.get("source_refs") or []
+    if not isinstance(source_refs, list):
+        source_refs = []
+    if not source_refs:
+        source_refs = [
+            {
+                "type": "item",
+                "item_id": item.id,
+                "title": item.title,
+                "url": item.primary_url,
+            }
+        ]
+    confidence = parsed.get("confidence")
+    try:
+        confidence_value = float(confidence) if confidence is not None else 0.45
+    except (TypeError, ValueError):
+        confidence_value = 0.45
+    return {
+        "summary_short": summary_short,
+        "summary_bullets": summary_bullets,
+        "key_dates": key_dates,
+        "key_requirements": key_requirements,
+        "risk_flags": risk_flags,
+        "course_context": course_context,
+        "confidence": confidence_value,
+        "source_refs": source_refs,
+    }
 
 
 def _truncate_body(body: str, limit: int) -> str:

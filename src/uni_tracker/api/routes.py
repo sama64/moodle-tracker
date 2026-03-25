@@ -8,15 +8,18 @@ from uni_tracker.db import SessionLocal
 from uni_tracker.models import Course, ItemFact, NormalizedItem, Notification
 from uni_tracker.schemas import (
     AcknowledgeResponse,
+    CourseBriefResponse,
     CourseResponse,
     HealthSnapshotResponse,
     HealthResponse,
+    ItemBriefResponse,
     ItemProvenanceResponse,
     ItemResponse,
     NotificationResponse,
     ProvenanceFactResponse,
     SyncResult,
 )
+from uni_tracker.services.briefs import get_course_brief, get_item_brief
 from uni_tracker.services.health import get_health_snapshot
 from uni_tracker.services.notifications import acknowledge_item, dispatch_due_notifications, schedule_daily_digest
 from uni_tracker.services.notifications import build_digest_message
@@ -84,6 +87,24 @@ def _item_response(item: NormalizedItem) -> ItemResponse:
     )
 
 
+def _brief_item_response(payload: dict) -> ItemBriefResponse:
+    return ItemBriefResponse(
+        brief_id=payload["brief_id"],
+        origin=payload["origin"],
+        model=payload["model"],
+        generated_at=payload["generated_at"],
+        summary_short=payload["summary_short"],
+        summary_bullets=payload["summary_bullets"],
+        key_dates=payload["key_dates"],
+        key_requirements=payload["key_requirements"],
+        risk_flags=payload["risk_flags"],
+        course_context=payload["course_context"],
+        confidence=payload["confidence"],
+        source_refs=payload["source_refs"],
+        item=_item_response(payload["item"]),
+    )
+
+
 @router.get("/items", response_model=list[ItemResponse])
 def list_items(limit: int = 100) -> list[ItemResponse]:
     with SessionLocal() as session:
@@ -134,6 +155,15 @@ def item_provenance(item_id: int) -> ItemProvenanceResponse:
         )
 
 
+@router.get("/items/{item_id}/brief", response_model=ItemBriefResponse)
+def item_brief(item_id: int) -> ItemBriefResponse:
+    with SessionLocal() as session:
+        payload = get_item_brief(session, item_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return _brief_item_response(payload)
+
+
 @router.get("/changes/recent", response_model=list[ItemResponse])
 def recent_changes(window_hours: int = 48) -> list[ItemResponse]:
     with SessionLocal() as session:
@@ -169,6 +199,27 @@ def course_snapshot(course_id: int) -> dict:
             ).model_dump(),
             "items": [_item_response(item).model_dump() for item in payload["items"]],
         }
+
+
+@router.get("/courses/{course_id}/brief", response_model=CourseBriefResponse)
+def course_brief(course_id: int) -> CourseBriefResponse:
+    with SessionLocal() as session:
+        payload = get_course_brief(session, course_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Course not found")
+        return CourseBriefResponse(
+            course=CourseResponse(
+                id=payload["course"].id,
+                external_id=payload["course"].external_id,
+                display_name=payload["course"].display_name,
+                shortname=payload["course"].shortname,
+                course_url=payload["course"].course_url,
+                updated_at=payload["course"].updated_at,
+            ),
+            summary_short=payload["summary_short"],
+            origin=payload["origin"],
+            items=[_brief_item_response(brief) for brief in payload["items"]],
+        )
 
 
 @router.post("/items/{item_id}/acknowledge", response_model=AcknowledgeResponse)

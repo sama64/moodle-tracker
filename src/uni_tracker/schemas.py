@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -67,6 +68,29 @@ class ItemProvenanceResponse(BaseModel):
     item: ItemResponse
     facts: list[ProvenanceFactResponse]
     notifications: list[NotificationResponse]
+
+
+class ItemBriefResponse(BaseModel):
+    brief_id: int | None
+    origin: str
+    model: str | None
+    generated_at: datetime | None
+    summary_short: str
+    summary_bullets: list[Any]
+    key_dates: list[Any]
+    key_requirements: list[Any]
+    risk_flags: list[Any]
+    course_context: dict[str, Any]
+    confidence: float
+    source_refs: list[Any]
+    item: ItemResponse
+
+
+class CourseBriefResponse(BaseModel):
+    course: CourseResponse
+    summary_short: str
+    origin: str
+    items: list[ItemBriefResponse]
 
 
 class AcknowledgeResponse(BaseModel):

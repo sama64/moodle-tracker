@@ -7,13 +7,15 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from uni_tracker.db import Base
-from uni_tracker.models import Course, Notification, SourceAccount, SourceObject
+from uni_tracker.models import Course, ItemBrief, Notification, SourceAccount, SourceObject
 from uni_tracker.services.notifications import (
     dispatch_due_notifications,
     build_digest_message,
     schedule_daily_digest,
     schedule_notifications_for_item,
 )
+from uni_tracker.services.briefs import get_item_brief
+from uni_tracker.services.llm import enrich_recent_items
 from uni_tracker.services.persistence import ItemChange, upsert_normalized_item
 from uni_tracker.services.telegram_bot import poll_telegram_commands
 from uni_tracker.services.tools import get_item_course_name, get_risk_items
@@ -768,6 +770,117 @@ def test_get_item_course_name_resolves_from_categories() -> None:
 
     resolved = get_item_course_name(session, item)
     assert resolved == course.display_name
+
+
+def test_enrich_recent_items_promotes_item_brief(monkeypatch) -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+    upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="material_file",
+        title="Programa analítico Cálculo I.pdf",
+        body_text="Unidad 1: Taylor. Entrega final el 12 de abril.",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload={},
+        review_status="watch",
+        review_reason="high_risk_schedule_document",
+    )
+    session.commit()
+
+    class FakeResponse:
+        is_success = True
+        text = "ok"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": """```json
+{
+  \"summary_short\": \"Syllabus de Cálculo I con fecha clave de entrega en abril.\",
+  \"summary_bullets\": [\"Incluye la unidad 1\", \"Entrega el 12 de abril\"],
+  \"key_dates\": [{\"type\": \"due_at\", \"iso_datetime\": \"2026-04-12T02:00:00+00:00\", \"matched_text\": \"12 de abril\"}],
+  \"key_requirements\": [\"Revisar la unidad 1\"],
+  \"risk_flags\": [\"high_risk_schedule_document\"],
+  \"course_context\": {\"course_name\": \"Cálculo I\"},
+  \"confidence\": 0.87,
+  \"source_refs\": [{\"type\": \"item\", \"item_id\": 380}]
+}
+```"""
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, *args, **kwargs) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "uni_tracker.services.llm.get_settings",
+        lambda: SimpleNamespace(
+            enable_llm=True,
+            nvidia_api_key="test-key",
+            nvidia_api_url="https://example.invalid/v1/chat/completions",
+            nvidia_model="moonshotai/kimi-k2.5",
+            llm_body_char_limit=12000,
+        ),
+    )
+    monkeypatch.setattr("uni_tracker.services.llm.httpx.Client", FakeClient)
+
+    result = enrich_recent_items(session)
+    session.commit()
+
+    brief = session.scalar(select(ItemBrief))
+    assert result["processed"] == 1
+    assert brief is not None
+    assert brief.summary_short.startswith("Syllabus de Cálculo I")
+    assert brief.origin == "stored"
+    assert brief.model == "moonshotai/kimi-k2.5"
+
+
+def test_get_item_brief_falls_back_without_llm_data() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP 7",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=3),
+        primary_url=source_object.source_url,
+        raw_payload={},
+    )
+    session.commit()
+
+    brief = get_item_brief(session, item.id)
+    assert brief is not None
+    assert brief["origin"] == "fallback"
+    assert brief["item"].id == item.id
+    assert brief["summary_short"] == "TP 7"
+    assert brief["key_dates"]
 
 
 def test_build_digest_message_orders_course_blocks_by_soonest_due() -> None:
