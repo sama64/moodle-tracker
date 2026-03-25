@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from uni_tracker.models import Course, ItemBrief, NormalizedItem
+from uni_tracker.services.parsing import extract_date_facts_from_text, normalize_text
 from uni_tracker.services.timeutils import format_local_date_time
 
 
@@ -101,6 +103,75 @@ def get_course_brief(session: Session, course_id: int, limit: int = 10) -> dict[
         "summary_short": summary_short,
         "items": briefs,
         "origin": "mixed" if any(brief["origin"] == "fallback" for brief in briefs) else "stored",
+    }
+
+
+def is_item_brief_weak(item: NormalizedItem, brief: ItemBrief) -> bool:
+    summary_short = _coerce_string(brief.summary_short)
+    title = _coerce_string(item.title)
+    bullets = _coerce_string_list(brief.summary_bullets)
+    key_dates = brief.key_dates or []
+    key_requirements = _coerce_string_list(brief.key_requirements)
+    risk_flags = _coerce_string_list(brief.risk_flags)
+    course_context = brief.course_context or {}
+
+    if not summary_short:
+        return True
+    if summary_short.casefold() == title.casefold():
+        return True
+    if brief.confidence < 0.5 and len(bullets) <= 1:
+        return True
+    if item.item_type in {"material_file"} and len(bullets) <= 1 and not (key_dates or key_requirements or risk_flags):
+        return True
+    if not course_context:
+        return True
+    return False
+
+
+def build_deterministic_backfill_payload(session: Session, item: NormalizedItem) -> dict[str, Any]:
+    course_name = _course_name(session, item)
+    body_text = normalize_text(item.body_text or "")
+    unit_topics = _extract_unit_topics(body_text)
+    date_facts = extract_date_facts_from_text(body_text)
+    key_dates = [
+        {
+            "type": fact.fact_type,
+            "iso_datetime": fact.value.get("value"),
+            "matched_text": fact.value.get("matched_text"),
+        }
+        for fact in date_facts
+        if fact.value.get("value")
+    ]
+    key_requirements = _deterministic_requirements(body_text)
+    risk_flags = ["deterministic_backfill"]
+    if "bibliografía obligatoria" in body_text.casefold():
+        risk_flags.append("bibliography_required")
+    if "entrega" in body_text.casefold() or key_dates:
+        risk_flags.append("date_sensitive")
+
+    summary_short = _deterministic_summary(course_name, unit_topics, key_dates, body_text)
+    summary_bullets = _deterministic_bullets(unit_topics, key_dates, body_text)
+    source_refs = [
+        {
+            "type": "item",
+            "item_id": item.id,
+            "title": item.title,
+            "url": item.primary_url,
+        }
+    ]
+    return {
+        "summary_short": summary_short,
+        "summary_bullets": summary_bullets,
+        "key_dates": key_dates,
+        "key_requirements": key_requirements,
+        "risk_flags": risk_flags,
+        "course_context": {
+            "course_id": item.course_id,
+            "course_name": course_name,
+            "item_type": item.item_type,
+        },
+        "confidence": 0.65 if unit_topics or key_dates else 0.45,
+        "source_refs": source_refs,
     }
 
 
@@ -234,6 +305,56 @@ def _course_name(session: Session | None, item: NormalizedItem) -> str:
     if item.course_id is not None:
         return f"Course {item.course_id}"
     return "General"
+
+
+def _extract_unit_topics(body_text: str) -> list[str]:
+    matches = re.findall(
+        r"UNIDAD\s+\d+:\s*(.*?)(?=\s+Contenidos:|\s+Objetivos específicos|\s+Bibliografía|\s+UNIDAD\s+\d+:|$)",
+        body_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    topics = [normalize_text(match) for match in matches]
+    return [topic for topic in topics if topic]
+
+
+def _deterministic_requirements(body_text: str) -> list[str]:
+    requirements: list[str] = []
+    lowered = body_text.casefold()
+    if "bibliografía obligatoria" in lowered:
+        requirements.append("Revisar la bibliografía obligatoria")
+    if "objetivos específicos" in lowered:
+        requirements.append("Seguir los objetivos específicos de cada unidad")
+    if "entrega" in lowered:
+        requirements.append("Registrar las fechas de entrega mencionadas")
+    if "parcial" in lowered or "examen" in lowered:
+        requirements.append("Preparar evaluaciones parciales o finales")
+    return requirements
+
+
+def _deterministic_summary(course_name: str, unit_topics: list[str], key_dates: list[dict[str, Any]], body_text: str) -> str:
+    details: list[str] = []
+    if unit_topics:
+        details.append(f"{len(unit_topics)} unidades")
+    if key_dates:
+        details.append(f"{len(key_dates)} fecha(s) detectada(s)")
+    if "bibliografía obligatoria" in body_text.casefold():
+        details.append("bibliografía obligatoria y complementaria")
+    if details:
+        return f"{course_name}: " + ", ".join(details)
+    return course_name
+
+
+def _deterministic_bullets(unit_topics: list[str], key_dates: list[dict[str, Any]], body_text: str) -> list[str]:
+    bullets: list[str] = []
+    if unit_topics:
+        bullets.append(f"Unidades: {', '.join(unit_topics[:3])}")
+        bullets.append(f"Total de unidades detectadas: {len(unit_topics)}")
+    if "bibliografía obligatoria" in body_text.casefold():
+        bullets.append("Incluye bibliografía obligatoria y complementaria")
+    if key_dates:
+        first_date = key_dates[0]["matched_text"]
+        bullets.append(f"Fecha detectada: {first_date}")
+    return bullets[:4]
 
 
 def _coerce_string(value: Any) -> str:

@@ -7,15 +7,15 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from uni_tracker.db import Base
-from uni_tracker.models import Course, ItemBrief, Notification, SourceAccount, SourceObject
+from uni_tracker.models import Course, ItemBrief, LLMJob, Notification, SourceAccount, SourceObject
 from uni_tracker.services.notifications import (
     dispatch_due_notifications,
     build_digest_message,
     schedule_daily_digest,
     schedule_notifications_for_item,
 )
-from uni_tracker.services.briefs import get_item_brief
-from uni_tracker.services.llm import enrich_recent_items
+from uni_tracker.services.briefs import get_item_brief, upsert_item_brief
+from uni_tracker.services.llm import backfill_item_briefs, enrich_recent_items
 from uni_tracker.services.persistence import ItemChange, upsert_normalized_item
 from uni_tracker.services.telegram_bot import poll_telegram_commands
 from uni_tracker.services.tools import get_item_course_name, get_risk_items
@@ -850,11 +850,202 @@ def test_enrich_recent_items_promotes_item_brief(monkeypatch) -> None:
     session.commit()
 
     brief = session.scalar(select(ItemBrief))
+    job = session.scalar(select(LLMJob).order_by(LLMJob.id.desc()))
     assert result["processed"] == 1
     assert brief is not None
     assert brief.summary_short.startswith("Syllabus de Cálculo I")
     assert brief.origin == "stored"
     assert brief.model == "moonshotai/kimi-k2.5"
+    assert job is not None
+    assert job.status == "completed"
+
+
+def test_enrich_recent_items_rejects_title_echo_brief(monkeypatch) -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+    upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="material_file",
+        title="Programa analítico Cálculo I.pdf",
+        body_text="Unidad 1: Taylor. Entrega final el 12 de abril.",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload={},
+        review_status="watch",
+        review_reason="high_risk_schedule_document",
+    )
+    session.commit()
+
+    class WeakResponse:
+        is_success = True
+        text = "ok"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": """```json
+{
+  \"summary_short\": \"Programa analítico Cálculo I.pdf\",
+  \"summary_bullets\": [\"Programa analítico Cálculo I.pdf\"],
+  \"key_dates\": [],
+  \"key_requirements\": [],
+  \"risk_flags\": [],
+  \"course_context\": {\"course_name\": \"Cálculo I\"},
+  \"confidence\": 0.91,
+  \"source_refs\": [{\"type\": \"item\", \"item_id\": 380}]
+}
+```"""
+                        }
+                    }
+                ]
+            }
+
+    class WeakClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "WeakClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, *args, **kwargs) -> WeakResponse:
+            return WeakResponse()
+
+    monkeypatch.setattr(
+        "uni_tracker.services.llm.get_settings",
+        lambda: SimpleNamespace(
+            enable_llm=True,
+            nvidia_api_key="test-key",
+            nvidia_api_url="https://example.invalid/v1/chat/completions",
+            nvidia_model="moonshotai/kimi-k2.5",
+            llm_body_char_limit=12000,
+        ),
+    )
+    monkeypatch.setattr("uni_tracker.services.llm.httpx.Client", WeakClient)
+
+    result = enrich_recent_items(session)
+    session.commit()
+
+    brief = session.scalar(select(ItemBrief))
+    job = session.scalar(select(LLMJob).order_by(LLMJob.id.desc()))
+    assert result["processed"] == 0
+    assert brief is None
+    assert job is not None
+    assert job.status == "rejected"
+    assert "summary echoes title" in (job.error_text or "")
+
+
+def test_backfill_item_briefs_replaces_weak_brief(monkeypatch) -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="material_file",
+        title="Programa analítico Cálculo I.pdf",
+        body_text="Unidad 1: Taylor. Entrega final el 12 de abril.",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload={},
+        review_status="watch",
+        review_reason="high_risk_schedule_document",
+    )
+    upsert_item_brief(
+        session,
+        item=item,
+        payload={
+            "summary_short": item.title,
+            "summary_bullets": [item.title],
+            "key_dates": [],
+            "key_requirements": [],
+            "risk_flags": [],
+            "course_context": {"course_name": course.display_name},
+            "confidence": 0.2,
+            "source_refs": [{"type": "item", "item_id": item.id}],
+        },
+        model="moonshotai/kimi-k2.5",
+        llm_job_id=None,
+        origin="stored",
+    )
+    session.commit()
+
+    class WeakResponse:
+        is_success = True
+        text = "ok"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": """```json
+{
+  \"summary_short\": \"Programa analítico Cálculo I.pdf\",
+  \"summary_bullets\": [\"Programa analítico Cálculo I.pdf\"],
+  \"key_dates\": [],
+  \"key_requirements\": [],
+  \"risk_flags\": [],
+  \"course_context\": {\"course_name\": \"Cálculo I\"},
+  \"confidence\": 0.91,
+  \"source_refs\": [{\"type\": \"item\", \"item_id\": 380}]
+}
+```"""
+                        }
+                    }
+                ]
+            }
+
+    class WeakClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "WeakClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, *args, **kwargs) -> WeakResponse:
+            return WeakResponse()
+
+    monkeypatch.setattr(
+        "uni_tracker.services.llm.get_settings",
+        lambda: SimpleNamespace(
+            enable_llm=True,
+            nvidia_api_key="test-key",
+            nvidia_api_url="https://example.invalid/v1/chat/completions",
+            nvidia_model="moonshotai/kimi-k2.5",
+            llm_body_char_limit=12000,
+        ),
+    )
+    monkeypatch.setattr("uni_tracker.services.llm.httpx.Client", WeakClient)
+
+    result = backfill_item_briefs(session, [item], force=True)
+    session.commit()
+
+    brief = session.scalar(select(ItemBrief))
+    assert result["processed"] == 1
+    assert brief is not None
+    assert brief.origin == "backfill"
+    assert brief.summary_short.startswith(course.display_name)
+    assert len(brief.summary_bullets) >= 2
 
 
 def test_get_item_brief_falls_back_without_llm_data() -> None:

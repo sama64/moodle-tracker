@@ -11,19 +11,22 @@ from sqlalchemy.orm import Session
 
 from uni_tracker.config import get_settings
 from uni_tracker.models import ItemFact, LLMJob, NormalizedItem
-from uni_tracker.services.briefs import upsert_item_brief
+from uni_tracker.services.briefs import build_deterministic_backfill_payload, upsert_item_brief
 
 
 class LLMUnavailable(RuntimeError):
     pass
 
 
-def build_nvidia_client() -> httpx.Client:
+SUMMARY_FINAL_STATUSES = {"completed", "rejected"}
+
+
+def build_nvidia_client(*, timeout_seconds: float = 60.0) -> httpx.Client:
     settings = get_settings()
     if not settings.nvidia_api_key:
         raise LLMUnavailable("NVIDIA_API_KEY is not configured.")
     return httpx.Client(
-        timeout=60.0,
+        timeout=timeout_seconds,
         headers={
             "Authorization": f"Bearer {settings.nvidia_api_key}",
             "Accept": "application/json",
@@ -51,115 +54,261 @@ def enrich_recent_items(session: Session, limit: int = 10) -> dict[str, int]:
     processed = 0
     with build_nvidia_client() as client:
         for item in items:
-            if item.brief is not None:
-                continue
-            truncated_body = _truncate_body(item.body_text or "", settings.llm_body_char_limit)
-            prompt = (
-                "You are compressing Moodle content into a compact agent brief.\n"
-                "Return JSON only with keys summary_short, summary_bullets, key_dates, key_requirements, risk_flags, course_context, confidence, source_refs.\n"
-                "summary_short must be a short Spanish summary.\n"
-                "summary_bullets must be a short array of Spanish bullet fragments.\n"
-                "key_dates must be an array of objects with keys type, iso_datetime, matched_text.\n"
-                "key_requirements must be an array of short strings.\n"
-                "risk_flags must be an array of short strings.\n"
-                "course_context must be a small object describing the course/item context.\n"
-                "source_refs must be an array of compact references to the source.\n"
-                "Use null iso_datetime if ambiguous.\n\n"
-                f"Title: {item.title}\n"
-                f"Body:\n{truncated_body}\n"
+            outcome = _process_item_brief(
+                session=session,
+                client=client,
+                item=item,
+                settings=settings,
+                force=False,
+                origin="stored",
             )
-            job = LLMJob(
-                normalized_item_id=item.id,
-                raw_artifact_id=None,
-                job_type="summary",
-                provider="nvidia",
-                model=settings.nvidia_model,
-                status="running",
-                request_payload={"prompt": prompt},
+            if outcome == "processed":
+                processed += 1
+    return {"processed": processed, "skipped": max(len(items) - processed, 0)}
+
+
+def backfill_item_briefs(session: Session, items: list[NormalizedItem], *, force: bool = True) -> dict[str, int]:
+    settings = get_settings()
+    if not settings.enable_llm or not settings.nvidia_api_key:
+        return {"processed": 0, "skipped": len(items)}
+    if not items:
+        return {"processed": 0, "skipped": 0}
+
+    processed = 0
+    with build_nvidia_client(timeout_seconds=180.0) as client:
+        for item in items:
+            outcome = _process_item_brief(
+                session=session,
+                client=client,
+                item=item,
+                settings=settings,
+                force=force,
+                origin="backfill",
             )
-            session.add(job)
-            session.flush()
-            try:
-                response = client.post(
-                    settings.nvidia_api_url,
-                    json={
-                        "model": settings.nvidia_model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 1200,
-                        "temperature": 0.2,
-                        "top_p": 1.0,
-                        "stream": False,
-                        "chat_template_kwargs": {"thinking": True},
-                    },
+            if outcome == "processed":
+                processed += 1
+            elif outcome in {"rejected", "failed"}:
+                payload = build_deterministic_backfill_payload(session, item)
+                job = LLMJob(
+                    normalized_item_id=item.id,
+                    raw_artifact_id=None,
+                    job_type="summary",
+                    provider="deterministic",
+                    model="deterministic_backfill",
+                    status="completed",
+                    request_payload={"source": "deterministic_backfill"},
+                    response_payload={"source": "deterministic_backfill"},
+                    output_text=payload["summary_short"],
+                    finished_at=datetime.now(UTC),
                 )
-                response.raise_for_status()
-                payload = response.json()
-                message = _normalize_message_content(payload["choices"][0]["message"].get("content"))
-                parsed = _parse_llm_payload(message)
-                job.status = "completed"
-                job.response_payload = payload
-                job.output_text = message
-                job.finished_at = datetime.now(UTC)
-                brief_payload = _build_brief_payload(item, parsed, message)
-                session.add(
-                    ItemFact(
-                        normalized_item_id=item.id,
-                        source_artifact_id=None,
-                        fact_type="llm_summary",
-                        value_json={"summary": brief_payload["summary_short"]},
-                        confidence=0.5,
-                        extractor_type="llm_kimi_k2_5",
-                        source_span=item.title,
-                    )
-                )
-                for date_fact in parsed.get("key_dates") or parsed.get("dates") or []:
-                    iso_datetime = date_fact.get("iso_datetime")
-                    if not iso_datetime:
-                        continue
-                    session.add(
-                        ItemFact(
-                            normalized_item_id=item.id,
-                            source_artifact_id=None,
-                            fact_type=date_fact.get("type") or "date_mention",
-                            value_json={
-                                "value": iso_datetime,
-                                "matched_text": date_fact.get("matched_text"),
-                            },
-                            confidence=0.45,
-                            extractor_type="llm_kimi_k2_5",
-                            source_span=date_fact.get("matched_text"),
-                        )
-                    )
-                risk_flags = parsed.get("risk_flags") or parsed.get("urgent_signals") or []
-                if risk_flags:
-                    session.add(
-                        ItemFact(
-                            normalized_item_id=item.id,
-                            source_artifact_id=None,
-                            fact_type="llm_urgent_signals",
-                            value_json={"signals": risk_flags},
-                            confidence=0.45,
-                            extractor_type="llm_kimi_k2_5",
-                            source_span=item.title,
-                        )
-                    )
+                session.add(job)
+                session.flush()
                 upsert_item_brief(
                     session,
                     item=item,
-                    payload=brief_payload,
-                    model=settings.nvidia_model,
+                    payload=payload,
+                    model="deterministic_backfill",
                     llm_job_id=job.id,
                     source_artifact_id=None,
+                    origin="backfill",
                 )
                 processed += 1
-            except Exception as exc:
-                job.status = "failed"
-                job.error_text = str(exc)
-                job.finished_at = datetime.now(UTC)
     return {"processed": processed, "skipped": max(len(items) - processed, 0)}
 
 
 JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _build_brief_prompt(item: NormalizedItem, truncated_body: str) -> str:
+    document_kind = _infer_document_kind(item)
+    if document_kind == "syllabus":
+        extra_guidance = (
+            "This is a syllabus / programmatic document. Focus on units, evaluation, deadlines, attendance rules, and any date-sensitive obligations.\n"
+            "Do not echo the title; summarize the content.\n"
+            "Prefer 3 to 5 bullets with concrete facts.\n"
+        )
+    elif document_kind == "announcement":
+        extra_guidance = (
+            "This is an announcement or forum post. Focus on what changed, who is affected, and what action is required.\n"
+            "Do not echo the title; summarize the change.\n"
+        )
+    elif document_kind == "assignment":
+        extra_guidance = (
+            "This is an assignment or quiz item. Focus on due dates, requirements, deliverables, grading notes, and deadlines.\n"
+            "Do not echo the title; summarize the obligations.\n"
+        )
+    else:
+        extra_guidance = (
+            "Summarize the academic content compactly. If the text contains dates, deadlines, obligations, or exam-related information, extract them explicitly.\n"
+            "Do not echo the title; summarize the substance.\n"
+        )
+
+    return (
+        "You are compressing Moodle content into a compact agent brief.\n"
+        "Return JSON only with keys summary_short, summary_bullets, key_dates, key_requirements, risk_flags, course_context, confidence, source_refs.\n"
+        "summary_short must be a short Spanish summary with real content, not just the filename or title.\n"
+        "summary_bullets must be a short array of Spanish bullet fragments with at least 2 non-empty bullets when the document is substantive.\n"
+        "key_dates must be an array of objects with keys type, iso_datetime, matched_text.\n"
+        "key_requirements must be an array of short strings.\n"
+        "risk_flags must be an array of short strings.\n"
+        "course_context must be a small object describing the course/item context.\n"
+        "source_refs must be an array of compact references to the source.\n"
+        "Use null iso_datetime if ambiguous.\n"
+        f"document_kind: {document_kind}\n\n"
+        f"{extra_guidance}"
+        f"Title: {item.title}\n"
+        f"Body:\n{truncated_body}\n"
+    )
+
+
+def _process_item_brief(
+    *,
+    session: Session,
+    client: httpx.Client,
+    item: NormalizedItem,
+    settings,
+    force: bool,
+    origin: str,
+) -> str:
+    if not force and (item.brief is not None or _has_final_summary_job(item)):
+        return "skipped"
+
+    truncated_body = _truncate_body(item.body_text or "", settings.llm_body_char_limit)
+    prompt = _build_brief_prompt(item, truncated_body)
+    job = LLMJob(
+        normalized_item_id=item.id,
+        raw_artifact_id=None,
+        job_type="summary",
+        provider="nvidia",
+        model=settings.nvidia_model,
+        status="running",
+        request_payload={"prompt": prompt},
+    )
+    session.add(job)
+    session.flush()
+    try:
+        response = client.post(
+            settings.nvidia_api_url,
+            json={
+                "model": settings.nvidia_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1200,
+                "temperature": 0.2,
+                "top_p": 1.0,
+                "stream": False,
+                "chat_template_kwargs": {"thinking": True},
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        message = _normalize_message_content(payload["choices"][0]["message"].get("content"))
+        parsed = _parse_llm_payload(message)
+        brief_payload = _build_brief_payload(item, parsed, message)
+        quality_error = _validate_brief_payload(item, brief_payload)
+        job.response_payload = payload
+        job.output_text = message
+        job.finished_at = datetime.now(UTC)
+        if quality_error is not None:
+            job.status = "rejected"
+            job.error_text = quality_error
+            session.flush()
+            return "rejected"
+        job.status = "completed"
+        session.add(
+            ItemFact(
+                normalized_item_id=item.id,
+                source_artifact_id=None,
+                fact_type="llm_summary",
+                value_json={"summary": brief_payload["summary_short"]},
+                confidence=0.5,
+                extractor_type="llm_kimi_k2_5",
+                source_span=item.title,
+            )
+        )
+        for date_fact in parsed.get("key_dates") or parsed.get("dates") or []:
+            iso_datetime = date_fact.get("iso_datetime")
+            if not iso_datetime:
+                continue
+            session.add(
+                ItemFact(
+                    normalized_item_id=item.id,
+                    source_artifact_id=None,
+                    fact_type=date_fact.get("type") or "date_mention",
+                    value_json={
+                        "value": iso_datetime,
+                        "matched_text": date_fact.get("matched_text"),
+                    },
+                    confidence=0.45,
+                    extractor_type="llm_kimi_k2_5",
+                    source_span=date_fact.get("matched_text"),
+                )
+            )
+        risk_flags = parsed.get("risk_flags") or parsed.get("urgent_signals") or []
+        if risk_flags:
+            session.add(
+                ItemFact(
+                    normalized_item_id=item.id,
+                    source_artifact_id=None,
+                    fact_type="llm_urgent_signals",
+                    value_json={"signals": risk_flags},
+                    confidence=0.45,
+                    extractor_type="llm_kimi_k2_5",
+                    source_span=item.title,
+                )
+            )
+        upsert_item_brief(
+            session,
+            item=item,
+            payload=brief_payload,
+            model=settings.nvidia_model,
+            llm_job_id=job.id,
+            source_artifact_id=None,
+            origin=origin,
+        )
+        return "processed"
+    except Exception as exc:
+        job.status = "failed"
+        job.error_text = str(exc)
+        job.finished_at = datetime.now(UTC)
+        return "failed"
+
+
+def _validate_brief_payload(item: NormalizedItem, payload: dict[str, Any]) -> str | None:
+    summary_short = _coerce_text(payload.get("summary_short"))
+    title = _coerce_text(item.title)
+    bullets = [bullet for bullet in _coerce_string_list(payload.get("summary_bullets")) if bullet]
+    key_dates = payload.get("key_dates") or []
+    key_requirements = _coerce_string_list(payload.get("key_requirements"))
+    risk_flags = _coerce_string_list(payload.get("risk_flags"))
+    document_kind = _infer_document_kind(item)
+
+    if not summary_short:
+        return "brief_quality_rejected: missing summary_short"
+    if summary_short.casefold() == title.casefold():
+        return "brief_quality_rejected: summary echoes title"
+    if document_kind in {"syllabus", "assignment"} and len(bullets) < 2:
+        return "brief_quality_rejected: insufficient bullet detail"
+    if document_kind == "syllabus" and not (key_dates or key_requirements or risk_flags):
+        return "brief_quality_rejected: syllabus lacked extracted dates or requirements"
+    return None
+
+
+def _infer_document_kind(item: NormalizedItem) -> str:
+    title = (item.title or "").casefold()
+    review_reason = (item.review_reason or "").casefold()
+    if "programa anal" in title or "syllabus" in title or "program" in title:
+        return "syllabus"
+    if "high_risk_schedule_document" in review_reason:
+        return "syllabus"
+    if item.item_type in {"assignment", "quiz"}:
+        return "assignment"
+    if item.item_type in {"forum", "forum_discussion", "announcement"}:
+        return "announcement"
+    return "material"
+
+
+def _has_final_summary_job(item: NormalizedItem) -> bool:
+    return any(job.job_type == "summary" and job.status in SUMMARY_FINAL_STATUSES for job in item.llm_jobs)
 
 
 def _parse_llm_payload(message: str) -> dict[str, Any]:
@@ -216,6 +365,34 @@ def _build_brief_payload(item: NormalizedItem, parsed: dict[str, Any], message: 
         "confidence": confidence_value,
         "source_refs": source_refs,
     }
+
+
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        result: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+            else:
+                text = str(item).strip()
+            if text:
+                result.append(text)
+        return result
+    text = str(value).strip()
+    return [text] if text else []
 
 
 def _truncate_body(body: str, limit: int) -> str:
