@@ -144,6 +144,7 @@ python -m compileall -q src scripts
 ## Notes
 
 - Moodle is the primary source of truth.
-- Raw source artifacts are retained for provenance and replay.
+- Raw source artifacts are retained under `data/uni-tracker/artifacts/runtime/` for provenance and replay.
+- Postgres persists in the named Docker volume `uni_tracker_postgres_data`.
 - Human-facing alerts stay conservative and source-linked.
 - Agent-facing consumers should prefer briefs and provenance over raw Moodle pages whenever possible.

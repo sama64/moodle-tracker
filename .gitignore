@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 artifacts/
+data/
 .pytest_cache/
 .mypy_cache/
 .coverage

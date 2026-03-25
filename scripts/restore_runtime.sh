@@ -14,10 +14,11 @@ if [[ ! -f "${BACKUP_DIR}/db.sql" ]]; then
   exit 1
 fi
 
-docker exec -i uni-tracker-db-1 psql -U uni_tracker -d uni_tracker < "${BACKUP_DIR}/db.sql"
+docker compose exec -T db psql -U uni_tracker -d uni_tracker < "${BACKUP_DIR}/db.sql"
 
 if [[ -f "${BACKUP_DIR}/runtime_artifacts.tar.gz" ]]; then
-  tar -C "${ROOT_DIR}/artifacts" -xzf "${BACKUP_DIR}/runtime_artifacts.tar.gz"
+  mkdir -p "${ROOT_DIR}/data/uni-tracker/artifacts"
+  tar -C "${ROOT_DIR}/data/uni-tracker/artifacts" -xzf "${BACKUP_DIR}/runtime_artifacts.tar.gz"
 fi
 
 echo "Restore completed from ${BACKUP_DIR}"

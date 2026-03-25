@@ -7,7 +7,7 @@ services:
       POSTGRES_USER: uni_tracker
       POSTGRES_PASSWORD: uni_tracker
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - uni_tracker_postgres_data:/var/lib/postgresql/data
 
   api:
     build: .
@@ -17,7 +17,7 @@ services:
     environment:
       PYTHONPATH: /app/src
     volumes:
-      - ./artifacts:/app/artifacts
+      - ./data/uni-tracker:/app/data/uni-tracker
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -34,7 +34,7 @@ services:
     environment:
       PYTHONPATH: /app/src
     volumes:
-      - ./artifacts:/app/artifacts
+      - ./data/uni-tracker:/app/data/uni-tracker
     depends_on:
       - db
     command: >
@@ -42,4 +42,4 @@ services:
       python -m uni_tracker.worker"
 
 volumes:
-  postgres-data:
+  uni_tracker_postgres_data:

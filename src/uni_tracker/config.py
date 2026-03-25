@@ -20,7 +20,7 @@ class Settings(BaseSettings):
         default="postgresql+psycopg://uni_tracker:uni_tracker@localhost:5432/uni_tracker",
         alias="DATABASE_URL",
     )
-    raw_storage_path: Path = Field(default=Path("artifacts/runtime"), alias="RAW_STORAGE_PATH")
+    raw_storage_path: Path = Field(default=Path("data/uni-tracker/artifacts/runtime"), alias="RAW_STORAGE_PATH")
     sync_courses_interval_minutes: int = Field(default=30, alias="SYNC_COURSES_INTERVAL_MINUTES")
     sync_contents_interval_minutes: int = Field(default=60, alias="SYNC_CONTENTS_INTERVAL_MINUTES")
     file_download_limit_per_run: int = Field(default=5, alias="FILE_DOWNLOAD_LIMIT_PER_RUN")
@@ -52,7 +52,7 @@ def get_settings() -> Settings:
     try:
         settings.raw_storage_path.mkdir(parents=True, exist_ok=True)
     except OSError:
-        fallback = Path("artifacts/runtime")
+        fallback = Path("data/uni-tracker/artifacts/runtime")
         fallback.mkdir(parents=True, exist_ok=True)
         settings.raw_storage_path = fallback
     return settings
