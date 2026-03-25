@@ -18,7 +18,14 @@ src/uni_tracker/collectors/__init__.py
 src/uni_tracker/collectors/base.py
 src/uni_tracker/collectors/moodle.py
 src/uni_tracker/services/__init__.py
+src/uni_tracker/services/calendar.py
+src/uni_tracker/services/health.py
+src/uni_tracker/services/llm.py
 src/uni_tracker/services/moodle.py
+src/uni_tracker/services/notifications.py
+src/uni_tracker/services/parsing.py
+src/uni_tracker/services/persistence.py
 src/uni_tracker/services/storage.py
 src/uni_tracker/services/sync.py
+src/uni_tracker/services/tools.py
 tests/test_health.py

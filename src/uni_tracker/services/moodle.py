@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from typing import Any
 
 import httpx
@@ -32,39 +34,11 @@ class MoodleServiceClient:
 
     def token(self) -> str:
         if self._token is None:
-            response = self._http.get(
-                "/login/token.php",
-                params={
-                    "username": self.settings.moodle_username,
-                    "password": self.settings.moodle_password,
-                    "service": self.settings.moodle_service,
-                },
-            )
-            response.raise_for_status()
-            payload = response.json()
-            token = payload.get("token")
-            if not token:
-                raise MoodleError(f"Failed to obtain Moodle token: {payload}")
-            self._token = token
+            self._token = self._fetch_token()
         return self._token
 
     def call(self, function_name: str, **params: Any) -> Any:
-        response = self._http.get(
-            "/webservice/rest/server.php",
-            params={
-                "wstoken": self.token(),
-                "wsfunction": function_name,
-                "moodlewsrestformat": "json",
-                **params,
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict) and payload.get("exception"):
-            raise MoodleError(
-                f"{function_name} failed: {payload.get('message', payload.get('exception'))}"
-            )
-        return payload
+        return self._call(function_name, params=params)
 
     def get_site_info(self) -> dict[str, Any]:
         payload = self.call("core_webservice_get_site_info")
@@ -95,6 +69,109 @@ class MoodleServiceClient:
             raise MoodleError(f"Unexpected updates payload for course {course_id}.")
         return payload
 
+    def get_forums_by_courses(self, course_ids: list[int]) -> list[dict[str, Any]]:
+        payload = self._call(
+            "mod_forum_get_forums_by_courses",
+            params={"courseids": course_ids},
+        )
+        if not isinstance(payload, list):
+            raise MoodleError("Unexpected forums payload.")
+        return payload
+
+    def get_forum_discussions(self, forum_id: int) -> dict[str, Any]:
+        payload = self.call("mod_forum_get_forum_discussions", forumid=forum_id)
+        if not isinstance(payload, dict):
+            raise MoodleError("Unexpected forum discussions payload.")
+        return payload
+
+    def get_assignments(self, course_ids: list[int]) -> dict[str, Any]:
+        payload = self._call("mod_assign_get_assignments", params={"courseids": course_ids})
+        if not isinstance(payload, dict):
+            raise MoodleError("Unexpected assignments payload.")
+        return payload
+
+    def get_grade_items(self, course_id: int) -> dict[str, Any]:
+        payload = self.call("core_grades_get_gradeitems", courseid=course_id)
+        if not isinstance(payload, dict):
+            raise MoodleError("Unexpected grade items payload.")
+        return payload
+
+    def get_calendar_export_token(self) -> str:
+        payload = self.call("core_calendar_get_calendar_export_token")
+        if not isinstance(payload, dict) or not payload.get("token"):
+            raise MoodleError(f"Unexpected calendar export token payload: {payload}")
+        return str(payload["token"])
+
+    def get_calendar_export(self, *, user_id: int, export_token: str, what: str = "all", period: str = "recentupcoming") -> str:
+        response = self._get_with_retries(
+            "/calendar/export_execute.php",
+            params={
+                "userid": user_id,
+                "authtoken": export_token,
+                "preset_what": what,
+                "preset_time": period,
+            },
+        )
+        return response.text
+
+    def download_file(self, url: str) -> bytes:
+        parsed = urlparse(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query["token"] = self.token()
+        tokenized = urlunparse(parsed._replace(query=urlencode(query)))
+        response = self._get_with_retries(tokenized)
+        return response.content
+
+    def _fetch_token(self) -> str:
+        response = self._get_with_retries(
+            "/login/token.php",
+            params={
+                "username": self.settings.moodle_username,
+                "password": self.settings.moodle_password,
+                "service": self.settings.moodle_service,
+            },
+        )
+        payload = response.json()
+        token = payload.get("token")
+        if not token:
+            raise MoodleError(f"Failed to obtain Moodle token: {payload}")
+        return token
+
+    def _call(self, function_name: str, *, params: dict[str, Any]) -> Any:
+        for attempt in range(2):
+            encoded = {
+                "wstoken": self.token(),
+                "wsfunction": function_name,
+                "moodlewsrestformat": "json",
+            }
+            encoded.update(_flatten_params(params))
+            response = self._get_with_retries("/webservice/rest/server.php", params=encoded)
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("exception"):
+                message = payload.get("message", payload.get("exception"))
+                if payload.get("errorcode") == "invalidtoken" and attempt == 0:
+                    self._token = None
+                    continue
+                raise MoodleError(f"{function_name} failed: {message}")
+            return payload
+        raise MoodleError(f"{function_name} failed after token refresh.")
+
+    def _get_with_retries(self, url: str, *, params: dict[str, Any] | None = None) -> httpx.Response:
+        delay_seconds = 1.0
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = self._http.get(url, params=params)
+                response.raise_for_status()
+                return response
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if attempt == 2:
+                    break
+                time.sleep(delay_seconds)
+                delay_seconds *= 2
+        raise MoodleError(str(last_error) if last_error else f"Request failed: {url}")
+
 
 def stable_hash(payload: Any) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -105,3 +182,20 @@ def epoch_to_datetime(epoch: int | None) -> datetime | None:
     if not epoch:
         return None
     return datetime.fromtimestamp(epoch, tz=UTC)
+
+
+def _flatten_params(params: dict[str, Any], prefix: str | None = None) -> dict[str, Any]:
+    flattened: dict[str, Any] = {}
+    for key, value in params.items():
+        current_key = f"{prefix}[{key}]" if prefix else key
+        if isinstance(value, dict):
+            flattened.update(_flatten_params(value, current_key))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                if isinstance(item, (dict, list)):
+                    flattened.update(_flatten_params({str(index): item}, current_key))
+                else:
+                    flattened[f"{current_key}[{index}]"] = item
+        else:
+            flattened[current_key] = value
+    return flattened

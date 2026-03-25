@@ -29,3 +29,51 @@ class SyncResult(BaseModel):
     collector: str
     status: str
     stats: dict
+
+
+class ItemResponse(BaseModel):
+    id: int
+    course_id: int | None
+    item_type: str
+    title: str
+    body_text: str | None
+    published_at: datetime | None
+    starts_at: datetime | None
+    due_at: datetime | None
+    primary_url: str | None
+    review_status: str
+    review_reason: str | None
+    updated_at: datetime
+
+
+class ProvenanceFactResponse(BaseModel):
+    fact_type: str
+    value_json: dict
+    confidence: float
+    extractor_type: str
+    source_span: str | None
+
+
+class NotificationResponse(BaseModel):
+    id: int
+    severity: str
+    kind: str
+    scheduled_for: datetime
+    sent_at: datetime | None
+    delivery_error: str | None
+
+
+class ItemProvenanceResponse(BaseModel):
+    item: ItemResponse
+    facts: list[ProvenanceFactResponse]
+    notifications: list[NotificationResponse]
+
+
+class AcknowledgeResponse(BaseModel):
+    ok: bool
+
+
+class HealthSnapshotResponse(BaseModel):
+    status: str
+    environment: str
+    details: dict

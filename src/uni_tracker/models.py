@@ -30,6 +30,7 @@ class SourceAccount(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     auth_health: Mapped[str] = mapped_column(String(50), default="unknown")
     last_auth_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     courses: Mapped[list["Course"]] = relationship(back_populates="source_account")
 
@@ -113,6 +114,7 @@ class RawArtifact(Base):
     size_bytes: Mapped[int] = mapped_column(Integer)
     extraction_status: Mapped[str] = mapped_column(String(50), default="not_applicable")
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     source_object: Mapped["SourceObject | None"] = relationship(back_populates="raw_artifacts")
@@ -139,10 +141,13 @@ class NormalizedItem(TimestampMixin, Base):
     primary_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     field_hash: Mapped[str] = mapped_column(String(64))
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    review_status: Mapped[str] = mapped_column(String(50), default="none")
+    review_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     source_object: Mapped["SourceObject"] = relationship(back_populates="normalized_items")
     versions: Mapped[list["ItemVersion"]] = relationship(back_populates="normalized_item")
     facts: Mapped[list["ItemFact"]] = relationship(back_populates="normalized_item")
+    llm_jobs: Mapped[list["LLMJob"]] = relationship(back_populates="normalized_item")
 
 
 class ItemVersion(Base):
@@ -187,6 +192,9 @@ class Notification(Base):
     kind: Mapped[str] = mapped_column(String(50))
     dedup_key: Mapped[str] = mapped_column(String(255))
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    ack_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    delivery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -199,3 +207,33 @@ class Acknowledgement(Base):
     normalized_item_id: Mapped[int | None] = mapped_column(ForeignKey("normalized_items.id"), nullable=True)
     actor: Mapped[str] = mapped_column(String(100))
     acknowledged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SystemState(Base):
+    __tablename__ = "system_state"
+    __table_args__ = (UniqueConstraint("key", name="uq_system_state_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(100))
+    value_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class LLMJob(Base):
+    __tablename__ = "llm_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    normalized_item_id: Mapped[int] = mapped_column(ForeignKey("normalized_items.id"))
+    raw_artifact_id: Mapped[int | None] = mapped_column(ForeignKey("raw_artifacts.id"), nullable=True)
+    job_type: Mapped[str] = mapped_column(String(100))
+    provider: Mapped[str] = mapped_column(String(100))
+    model: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(50))
+    request_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    output_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    normalized_item: Mapped["NormalizedItem"] = relationship(back_populates="llm_jobs")

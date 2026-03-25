@@ -1,7 +1,9 @@
 alembic<2.0,>=1.14
 apscheduler<4.0,>=3.10
 fastapi<1.0,>=0.115
+icalendar<7.0,>=6.1
 httpx<1.0,>=0.28
+pypdf<6.0,>=5.4
 psycopg[binary]<4.0,>=3.2
 pydantic-settings<3.0,>=2.6
 sqlalchemy<3.0,>=2.0.36

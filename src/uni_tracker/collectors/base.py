@@ -27,19 +27,25 @@ class BaseCollector(ABC):
         self.context = context
 
     def run(self) -> dict[str, Any]:
+        now = datetime.now(UTC)
         run = CollectorRun(
             collector_name=self.name,
             source_account_id=self.context.source_account.id,
             status="running",
         )
         self.context.session.add(run)
-        self.context.session.flush()
+        self.context.source_account.auth_health = "running"
+        self.context.source_account.last_auth_at = now
+        self.context.session.commit()
+        self.context.session.refresh(run)
 
         try:
             stats = self.collect(run)
             run.status = "completed"
             run.stats = stats
             run.finished_at = datetime.now(UTC)
+            self.context.source_account.auth_health = "healthy"
+            self.context.source_account.last_auth_at = datetime.now(UTC)
             self.context.session.commit()
             return {"status": run.status, "stats": stats}
         except Exception as exc:
@@ -49,6 +55,13 @@ class BaseCollector(ABC):
                 failure_run.status = "failed"
                 failure_run.error_text = str(exc)
                 failure_run.finished_at = datetime.now(UTC)
+            self.context.source_account = self.context.session.get(SourceAccount, self.context.source_account.id)
+            if self.context.source_account is not None:
+                self.context.source_account.auth_health = "degraded"
+                self.context.source_account.last_auth_at = datetime.now(UTC)
+                if "token" in str(exc).lower():
+                    self.context.source_account.auth_health = "auth_failed"
+            if failure_run is not None or self.context.source_account is not None:
                 self.context.session.commit()
             raise
 

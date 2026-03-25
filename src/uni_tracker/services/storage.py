@@ -14,10 +14,36 @@ class ArtifactStore:
 
     def write_json(self, relative_dir: str, stem: str, payload: Any) -> tuple[str, str, int]:
         content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        return self.write_text(relative_dir, stem, content, suffix=".json")
+
+    def write_text(
+        self,
+        relative_dir: str,
+        stem: str,
+        content: str,
+        *,
+        suffix: str = ".txt",
+    ) -> tuple[str, str, int]:
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        relative_path = Path(relative_dir) / f"{timestamp}-{stem}.json"
+        relative_path = Path(relative_dir) / f"{timestamp}-{stem}{suffix}"
         output_path = self.root / relative_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content, encoding="utf-8")
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return str(relative_path), content_hash, len(content.encode("utf-8"))
+
+    def write_bytes(
+        self,
+        relative_dir: str,
+        stem: str,
+        content: bytes,
+        *,
+        suffix: str,
+    ) -> tuple[str, str, int]:
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        relative_path = Path(relative_dir) / f"{timestamp}-{stem}{suffix}"
+        output_path = self.root / relative_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(content)
+        content_hash = hashlib.sha256(content).hexdigest()
+        return str(relative_path), content_hash, len(content)
