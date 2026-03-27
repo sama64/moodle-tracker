@@ -81,6 +81,7 @@ Useful endpoints:
 - `GET /courses/{course_id}/snapshot`
 - `GET /courses/{course_id}/brief`
 - `GET /changes/recent`
+- `GET /changes/since?since=2026-03-27T03:30:00Z`
 - `GET /deadlines/upcoming`
 - `GET /risks`
 - `GET /sync/collectors`
@@ -98,6 +99,29 @@ If Telegram is configured, the bot can answer:
 - `/deadlines`
 - `/changes`
 - `/help`
+
+## Polling For Changes
+
+For efficient external monitoring, prefer:
+
+```text
+GET /changes/since?since=<ISO-8601 timestamp>
+```
+
+Behavior:
+
+- Returns items with `updated_at >= since`
+- Orders results by `updated_at` ascending, then `id` ascending
+- Intended for cursor-based polling by external assistants or cron jobs
+
+Recommended pattern:
+
+1. Store the latest seen `updated_at`
+2. Poll `/changes/since`
+3. Alert on returned items
+4. Advance the cursor to the newest returned `updated_at`
+
+Use `/risks` and `/deadlines/upcoming` for periodic snapshots, not as your primary change feed.
 
 ## LLM Enrichment
 

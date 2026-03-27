@@ -18,6 +18,7 @@ Do not treat a brief as stronger than its source. A brief is a compression of ev
 Prefer these endpoints in this order:
 
 - `GET /health`
+- `GET /changes/since?since=<ISO-8601 timestamp>`
 - `GET /deadlines/upcoming`
 - `GET /risks`
 - `GET /changes/recent`
@@ -26,6 +27,8 @@ Prefer these endpoints in this order:
 - `GET /items/{item_id}/provenance`
 
 Use the course brief when you need a course-level summary. Use the item brief when you need a single assignment, quiz, announcement, or document. Use provenance when you need to justify a claim.
+
+For continuous monitoring, use `/changes/since` as the primary delta feed. Keep a cursor based on the highest returned `updated_at`. Use `/risks` and `/deadlines/upcoming` as periodic reconciliation endpoints, not as your main event stream.
 
 ## Interpretation Rules
 
