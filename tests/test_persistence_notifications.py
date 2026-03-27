@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -1046,6 +1047,176 @@ def test_backfill_item_briefs_replaces_weak_brief(monkeypatch) -> None:
     assert brief.origin == "backfill"
     assert brief.summary_short.startswith(course.display_name)
     assert len(brief.summary_bullets) >= 2
+
+
+def test_enrich_recent_items_retries_retryable_failures(monkeypatch) -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+    upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="material_file",
+        title="Programa analitico Calculo I.pdf",
+        body_text="Unidad 1: Taylor. Entrega final el 12 de abril.",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload={},
+        review_status="watch",
+        review_reason="high_risk_schedule_document",
+    )
+    session.commit()
+
+    class RetryResponse:
+        def __init__(self, status_code: int, payload: dict | None = None) -> None:
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = "retry"
+            self.headers: dict[str, str] = {}
+            self.request = httpx.Request("POST", "https://example.invalid")
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError("error", request=self.request, response=self)
+
+        def json(self) -> dict:
+            return self._payload
+
+    class RetryClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self.calls = 0
+
+        def __enter__(self) -> "RetryClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                return RetryResponse(503)
+            return RetryResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": """```json
+{
+  "summary_short": "Programa del curso con fecha de entrega en abril.",
+  "summary_bullets": ["Incluye contenidos de la primera unidad", "Entrega el 12 de abril"],
+  "key_dates": [{"type": "due_at", "iso_datetime": "2026-04-12T02:00:00+00:00", "matched_text": "12 de abril"}],
+  "key_requirements": ["Revisar la unidad 1"],
+  "risk_flags": ["high_risk_schedule_document"],
+  "course_context": {"course_name": "Cálculo I"},
+  "confidence": 0.87,
+  "source_refs": [{"type": "item", "item_id": 1}]
+}
+```"""
+                            }
+                        }
+                    ]
+                },
+            )
+
+    monkeypatch.setattr(
+        "uni_tracker.services.llm.get_settings",
+        lambda: SimpleNamespace(
+            enable_llm=True,
+            nvidia_api_key="test-key",
+            nvidia_api_url="https://example.invalid/v1/chat/completions",
+            nvidia_model="moonshotai/kimi-k2.5",
+            llm_body_char_limit=12000,
+            llm_request_max_attempts=3,
+            llm_retry_base_delay_seconds=0.0,
+            llm_retry_max_delay_seconds=0.0,
+            llm_retry_cooldown_minutes=180,
+        ),
+    )
+    monkeypatch.setattr("uni_tracker.services.llm.httpx.Client", RetryClient)
+    monkeypatch.setattr("uni_tracker.services.llm.time.sleep", lambda *_args, **_kwargs: None)
+
+    result = enrich_recent_items(session)
+    session.commit()
+
+    job = session.scalar(select(LLMJob).order_by(LLMJob.id.desc()))
+    assert result["processed"] == 1
+    assert job is not None
+    assert job.status == "completed"
+    assert job.request_payload["attempts"] == 3
+
+
+def test_enrich_recent_items_skips_recent_failed_jobs(monkeypatch) -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="material_file",
+        title="Programa analitico Calculo I.pdf",
+        body_text="Unidad 1: Taylor. Entrega final el 12 de abril.",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload={},
+        review_status="watch",
+        review_reason="high_risk_schedule_document",
+    )
+    session.add(
+        LLMJob(
+            normalized_item_id=item.id,
+            raw_artifact_id=None,
+            job_type="summary",
+            provider="nvidia",
+            model="moonshotai/kimi-k2.5",
+            status="failed",
+            request_payload={"attempts": 3},
+            error_text="503",
+            finished_at=datetime.now(UTC) - timedelta(minutes=15),
+        )
+    )
+    session.commit()
+
+    class ExplodingClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "ExplodingClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, *args, **kwargs):
+            raise AssertionError("client.post should not be called during cooldown")
+
+    monkeypatch.setattr(
+        "uni_tracker.services.llm.get_settings",
+        lambda: SimpleNamespace(
+            enable_llm=True,
+            nvidia_api_key="test-key",
+            nvidia_api_url="https://example.invalid/v1/chat/completions",
+            nvidia_model="moonshotai/kimi-k2.5",
+            llm_body_char_limit=12000,
+            llm_request_max_attempts=3,
+            llm_retry_base_delay_seconds=0.0,
+            llm_retry_max_delay_seconds=0.0,
+            llm_retry_cooldown_minutes=180,
+        ),
+    )
+    monkeypatch.setattr("uni_tracker.services.llm.httpx.Client", ExplodingClient)
+
+    result = enrich_recent_items(session)
+    session.commit()
+
+    assert result["processed"] == 0
+    jobs = session.scalars(select(LLMJob).order_by(LLMJob.id)).all()
+    assert len(jobs) == 1
 
 
 def test_get_item_brief_falls_back_without_llm_data() -> None:

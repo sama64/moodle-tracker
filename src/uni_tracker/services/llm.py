@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -170,7 +171,8 @@ def _process_item_brief(
     force: bool,
     origin: str,
 ) -> str:
-    if not force and (item.brief is not None or _has_final_summary_job(item)):
+    now = datetime.now(UTC)
+    if not force and (item.brief is not None or _has_final_summary_job(item) or _failed_recently(item, settings, now)):
         return "skipped"
 
     truncated_body = _truncate_body(item.body_text or "", settings.llm_body_char_limit)
@@ -187,9 +189,11 @@ def _process_item_brief(
     session.add(job)
     session.flush()
     try:
-        response = client.post(
-            settings.nvidia_api_url,
-            json={
+        response, attempts = _post_with_retries(
+            client=client,
+            settings=settings,
+            url=settings.nvidia_api_url,
+            request_json={
                 "model": settings.nvidia_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 1200,
@@ -208,6 +212,10 @@ def _process_item_brief(
         job.response_payload = payload
         job.output_text = message
         job.finished_at = datetime.now(UTC)
+        job.request_payload = {
+            "prompt": prompt,
+            "attempts": attempts,
+        }
         if quality_error is not None:
             job.status = "rejected"
             job.error_text = quality_error
@@ -270,7 +278,52 @@ def _process_item_brief(
         job.status = "failed"
         job.error_text = str(exc)
         job.finished_at = datetime.now(UTC)
+        attempts = _coerce_attempt_count(job.request_payload)
+        job.request_payload = {
+            "prompt": prompt,
+            "attempts": attempts,
+        }
         return "failed"
+
+
+def _post_with_retries(
+    *,
+    client: httpx.Client,
+    settings,
+    url: str,
+    request_json: dict[str, Any],
+) -> tuple[httpx.Response, int]:
+    max_attempts = max(int(getattr(settings, "llm_request_max_attempts", 3) or 3), 1)
+    base_delay = float(getattr(settings, "llm_retry_base_delay_seconds", 2.0) or 2.0)
+    max_delay = float(getattr(settings, "llm_retry_max_delay_seconds", 30.0) or 30.0)
+    attempt = 0
+    delay_seconds = max(base_delay, 0.0)
+    last_error: Exception | None = None
+
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            response = client.post(url, json=request_json)
+            if _is_retryable_response(response) and attempt < max_attempts:
+                last_error = httpx.HTTPStatusError(
+                    f"Retryable NVIDIA status: {response.status_code}",
+                    request=response.request,
+                    response=response,
+                )
+                _sleep_for_retry(response=response, delay_seconds=delay_seconds)
+                delay_seconds = min(delay_seconds * 2 if delay_seconds else base_delay, max_delay)
+                continue
+            return response, attempt
+        except httpx.TransportError as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            time.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 2 if delay_seconds else base_delay, max_delay)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("LLM request failed without response")
 
 
 def _validate_brief_payload(item: NormalizedItem, payload: dict[str, Any]) -> str | None:
@@ -311,6 +364,27 @@ def _has_final_summary_job(item: NormalizedItem) -> bool:
     return any(job.job_type == "summary" and job.status in SUMMARY_FINAL_STATUSES for job in item.llm_jobs)
 
 
+def _failed_recently(item: NormalizedItem, settings, now: datetime) -> bool:
+    cooldown_minutes = int(getattr(settings, "llm_retry_cooldown_minutes", 180) or 180)
+    if cooldown_minutes <= 0:
+        return False
+    latest_failed = max(
+        (
+            job
+            for job in item.llm_jobs
+            if job.job_type == "summary" and job.status == "failed"
+        ),
+        key=lambda job: job.finished_at or job.created_at,
+        default=None,
+    )
+    if latest_failed is None:
+        return False
+    last_attempt_at = latest_failed.finished_at or latest_failed.created_at
+    if last_attempt_at is None:
+        return False
+    return (now - last_attempt_at.astimezone(UTC)).total_seconds() < cooldown_minutes * 60
+
+
 def _parse_llm_payload(message: str) -> dict[str, Any]:
     match = JSON_BLOCK_RE.search(message)
     if not match:
@@ -325,6 +399,32 @@ def _parse_llm_payload(message: str) -> dict[str, Any]:
     parsed.setdefault("dates", [])
     parsed.setdefault("urgent_signals", [])
     return parsed
+
+
+def _is_retryable_response(response: httpx.Response) -> bool:
+    return int(getattr(response, "status_code", 200) or 200) in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _sleep_for_retry(*, response: httpx.Response, delay_seconds: float) -> None:
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        try:
+            time.sleep(max(float(retry_after), 0.0))
+            return
+        except ValueError:
+            pass
+    time.sleep(max(delay_seconds, 0.0))
+
+
+def _coerce_attempt_count(request_payload: dict[str, Any] | None) -> int:
+    if not request_payload:
+        return 1
+    attempts = request_payload.get("attempts")
+    try:
+        return max(int(attempts), 1)
+    except (TypeError, ValueError):
+        return 1
 
 
 def _build_brief_payload(item: NormalizedItem, parsed: dict[str, Any], message: str) -> dict[str, Any]:

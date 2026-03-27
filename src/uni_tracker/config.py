@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     telegram_polling_interval_seconds: int = Field(default=30, alias="TELEGRAM_POLLING_INTERVAL_SECONDS")
     enable_llm: bool = Field(default=False, alias="ENABLE_LLM")
     llm_body_char_limit: int = Field(default=12000, alias="LLM_BODY_CHAR_LIMIT")
+    llm_request_max_attempts: int = Field(default=3, alias="LLM_REQUEST_MAX_ATTEMPTS")
+    llm_retry_base_delay_seconds: float = Field(default=2.0, alias="LLM_RETRY_BASE_DELAY_SECONDS")
+    llm_retry_max_delay_seconds: float = Field(default=30.0, alias="LLM_RETRY_MAX_DELAY_SECONDS")
+    llm_retry_cooldown_minutes: int = Field(default=180, alias="LLM_RETRY_COOLDOWN_MINUTES")
     nvidia_api_key: str | None = Field(default=None, alias="NVIDIA_API_KEY")
     nvidia_api_url: str = Field(
         default="https://integrate.api.nvidia.com/v1/chat/completions",
