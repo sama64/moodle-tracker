@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
@@ -26,6 +28,7 @@ from uni_tracker.services.notifications import build_digest_message
 from uni_tracker.services.sync import COLLECTOR_REGISTRY, run_collector
 from uni_tracker.services.tools import (
     get_course_snapshot,
+    get_changes_since,
     get_item_provenance,
     get_recent_changes,
     get_risk_items,
@@ -168,6 +171,12 @@ def item_brief(item_id: int) -> ItemBriefResponse:
 def recent_changes(window_hours: int = 48) -> list[ItemResponse]:
     with SessionLocal() as session:
         return [_item_response(item) for item in get_recent_changes(session, window_hours=window_hours)]
+
+
+@router.get("/changes/since", response_model=list[ItemResponse])
+def changes_since(since: datetime) -> list[ItemResponse]:
+    with SessionLocal() as session:
+        return [_item_response(item) for item in get_changes_since(session, since=since)]
 
 
 @router.get("/deadlines/upcoming", response_model=list[ItemResponse])

@@ -12,8 +12,17 @@ from uni_tracker.models import Course, ItemFact, NormalizedItem, Notification
 
 def get_recent_changes(session: Session, window_hours: int = 48) -> list[NormalizedItem]:
     since = datetime.now(UTC) - timedelta(hours=window_hours)
+    return get_changes_since(session, since)
+
+
+def get_changes_since(session: Session, since: datetime) -> list[NormalizedItem]:
+    normalized_since = _normalize_datetime(since)
+    if normalized_since is None:
+        return []
     return session.scalars(
-        select(NormalizedItem).where(NormalizedItem.updated_at >= since).order_by(NormalizedItem.updated_at.desc())
+        select(NormalizedItem)
+        .where(NormalizedItem.updated_at >= normalized_since)
+        .order_by(NormalizedItem.updated_at.asc(), NormalizedItem.id.asc())
     ).all()
 
 

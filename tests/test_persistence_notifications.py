@@ -19,7 +19,7 @@ from uni_tracker.services.briefs import get_item_brief, upsert_item_brief
 from uni_tracker.services.llm import backfill_item_briefs, enrich_recent_items
 from uni_tracker.services.persistence import ItemChange, upsert_normalized_item
 from uni_tracker.services.telegram_bot import poll_telegram_commands
-from uni_tracker.services.tools import get_item_course_name, get_risk_items
+from uni_tracker.services.tools import get_changes_since, get_item_course_name, get_risk_items
 
 
 def make_session() -> Session:
@@ -1243,6 +1243,63 @@ def test_get_item_brief_falls_back_without_llm_data() -> None:
     assert brief["item"].id == item.id
     assert brief["summary_short"] == "TP 7"
     assert brief["key_dates"]
+
+
+def test_get_changes_since_returns_only_newer_items_in_ascending_order() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    first_item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP 1",
+        body_text="Primero",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=1),
+        primary_url=source_object.source_url,
+        raw_payload={"version": 1},
+    )
+    session.flush()
+    first_item.updated_at = datetime.now(UTC) - timedelta(hours=2)
+
+    second_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="module-2",
+        object_type="assign",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/module/2",
+        current_hash="hash-2",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(second_source)
+    session.flush()
+    second_item, _ = upsert_normalized_item(
+        session,
+        source_object_id=second_source.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP 2",
+        body_text="Segundo",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=2),
+        primary_url=second_source.source_url,
+        raw_payload={"version": 1},
+    )
+    session.flush()
+    second_item.updated_at = datetime.now(UTC) - timedelta(minutes=30)
+    session.commit()
+
+    since = datetime.now(UTC) - timedelta(hours=1)
+    changes = get_changes_since(session, since)
+
+    assert [item.title for item in changes] == ["TP 2"]
 
 
 def test_build_digest_message_orders_course_blocks_by_soonest_due() -> None:
