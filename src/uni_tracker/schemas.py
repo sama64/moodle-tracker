@@ -45,6 +45,9 @@ class ItemResponse(BaseModel):
     review_status: str
     review_reason: str | None
     updated_at: datetime
+    meaningful_key: str | None = None
+    meaningful_change: bool | None = None
+    change_kind: str | None = None
 
 
 class ProvenanceFactResponse(BaseModel):

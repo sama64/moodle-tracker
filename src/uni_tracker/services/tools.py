@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
 import re
 
@@ -15,15 +16,50 @@ def get_recent_changes(session: Session, window_hours: int = 48) -> list[Normali
     return get_changes_since(session, since)
 
 
-def get_changes_since(session: Session, since: datetime) -> list[NormalizedItem]:
+def get_changes_since(
+    session: Session,
+    since: datetime,
+    *,
+    include_meaningful_meta: bool = False,
+) -> list[NormalizedItem] | list[dict]:
     normalized_since = _normalize_datetime(since)
     if normalized_since is None:
         return []
-    return session.scalars(
+    items = session.scalars(
         select(NormalizedItem)
         .where(NormalizedItem.updated_at >= normalized_since)
         .order_by(NormalizedItem.updated_at.asc(), NormalizedItem.id.asc())
     ).all()
+    if not include_meaningful_meta:
+        return items
+
+    candidate_keys = [get_semantic_identity_key(item) for item in items]
+    historical_items = session.scalars(
+        select(NormalizedItem)
+        .where(NormalizedItem.updated_at < normalized_since)
+        .order_by(NormalizedItem.updated_at.desc(), NormalizedItem.id.desc())
+    ).all()
+    previous_by_identity: dict[str, NormalizedItem] = {}
+    for previous in historical_items:
+        identity_key = get_semantic_identity_key(previous)
+        if identity_key in candidate_keys and identity_key not in previous_by_identity:
+            previous_by_identity[identity_key] = previous
+
+    payloads: list[dict] = []
+    for item in items:
+        identity_key = get_semantic_identity_key(item)
+        previous = previous_by_identity.get(identity_key)
+        meaningful_key = get_meaningful_change_key(item)
+        previous_key = get_meaningful_change_key(previous) if previous is not None else None
+        payloads.append(
+            {
+                "item": item,
+                "meaningful_key": meaningful_key,
+                "meaningful_change": previous_key != meaningful_key,
+                "change_kind": get_change_kind(item, previous),
+            }
+        )
+    return payloads
 
 
 def get_upcoming_deadlines(session: Session, days: int = 10) -> list[NormalizedItem]:
@@ -86,6 +122,57 @@ def get_item_provenance(session: Session, item_id: int) -> dict:
 def get_item_course_name(session: Session, item: NormalizedItem) -> str:
     course = resolve_item_course(session, item)
     return course.display_name if course is not None else "General"
+
+
+def get_semantic_identity_key(item: NormalizedItem | None) -> str | None:
+    if item is None:
+        return None
+    return "|".join(
+        [
+            str(item.course_id or ""),
+            item.item_type,
+            _stable_title(item.title),
+            item.primary_url or "",
+        ]
+    )
+
+
+def get_meaningful_change_key(item: NormalizedItem | None) -> str | None:
+    if item is None:
+        return None
+    title = _stable_title(item.title)
+    primary_url = item.primary_url or ""
+    review_reason = item.review_reason or ""
+    review_status = item.review_status or ""
+    body_text = (item.body_text or "").strip()
+    payload = "|".join(
+        [
+            str(item.course_id or ""),
+            item.item_type,
+            title,
+            _datetime_key(item.due_at),
+            _datetime_key(item.starts_at),
+            review_status,
+            review_reason,
+            primary_url,
+            _body_digest(body_text),
+        ]
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_change_kind(item: NormalizedItem, previous: NormalizedItem | None) -> str:
+    if previous is None:
+        return "new"
+    if _datetime_key(item.due_at) != _datetime_key(previous.due_at):
+        return "deadline_changed"
+    if _datetime_key(item.starts_at) != _datetime_key(previous.starts_at):
+        return "schedule_changed"
+    if (item.review_status or "") != (previous.review_status or "") or (item.review_reason or "") != (previous.review_reason or ""):
+        return "review_changed"
+    if _stable_text(item.title) != _stable_text(previous.title) or _body_digest(item.body_text or "") != _body_digest(previous.body_text or ""):
+        return "content_changed"
+    return "refresh_only"
 
 
 def _is_risk_item(item: NormalizedItem, *, now: datetime, end: datetime) -> bool:
@@ -181,3 +268,35 @@ def _normalize_datetime(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _datetime_key(value: datetime | None) -> str:
+    normalized = _normalize_datetime(value)
+    if normalized is None:
+        return ""
+    return normalized.isoformat()
+
+
+def _stable_text(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _stable_title(value: str | None) -> str:
+    title = _stable_text(value)
+    for suffix in (
+        ' está en fecha de entrega',
+        ' esta en fecha de entrega',
+        ' cierra',
+        ' abre',
+    ):
+        if title.endswith(suffix):
+            title = title[: -len(suffix)].strip()
+            break
+    return title
+
+
+def _body_digest(value: str) -> str:
+    normalized = _stable_text(value)
+    if not normalized:
+        return ""
+    return sha256(normalized.encode("utf-8")).hexdigest()
