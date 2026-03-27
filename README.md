@@ -113,12 +113,16 @@ Behavior:
 - Returns items with `updated_at >= since`
 - Orders results by `updated_at` ascending, then `id` ascending
 - Intended for cursor-based polling by external assistants or cron jobs
+- Includes semantic delta metadata on each item:
+  - `meaningful_key`: stable hash of student-relevant fields
+  - `meaningful_change`: whether the item meaningfully changed vs the latest pre-cursor version
+  - `change_kind`: one of `new`, `deadline_changed`, `schedule_changed`, `review_changed`, `content_changed`, `refresh_only`
 
 Recommended pattern:
 
 1. Store the latest seen `updated_at`
 2. Poll `/changes/since`
-3. Alert on returned items
+3. Alert only when `meaningful_change == true` and `change_kind != refresh_only`
 4. Advance the cursor to the newest returned `updated_at`
 
 Use `/risks` and `/deadlines/upcoming` for periodic snapshots, not as your primary change feed.

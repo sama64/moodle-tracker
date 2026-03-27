@@ -1302,6 +1302,133 @@ def test_get_changes_since_returns_only_newer_items_in_ascending_order() -> None
     assert [item.title for item in changes] == ["TP 2"]
 
 
+def test_get_changes_since_can_mark_refresh_only_changes() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="calendar_event",
+        title="Quiz 1 closes",
+        body_text="Same event",
+        published_at=None,
+        starts_at=datetime.now(UTC) + timedelta(days=2),
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload={"version": 1},
+    )
+    session.flush()
+    item.updated_at = datetime.now(UTC) - timedelta(hours=2)
+    session.commit()
+
+    since = datetime.now(UTC) - timedelta(hours=1)
+    item.updated_at = datetime.now(UTC) - timedelta(minutes=5)
+    session.commit()
+
+    changes = get_changes_since(session, since, include_meaningful_meta=True)
+
+    assert len(changes) == 1
+    assert changes[0]["meaningful_change"] is False
+    assert changes[0]["change_kind"] == "refresh_only"
+
+
+def test_get_changes_since_can_mark_deadline_changed() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP 3",
+        body_text="Entrega",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=2),
+        primary_url=source_object.source_url,
+        raw_payload={"version": 1},
+    )
+    session.flush()
+    item.updated_at = datetime.now(UTC) - timedelta(hours=2)
+    original_due_at = item.due_at
+    session.commit()
+
+    since = datetime.now(UTC) - timedelta(hours=1)
+    item.due_at = original_due_at + timedelta(days=1)
+    item.updated_at = datetime.now(UTC) - timedelta(minutes=5)
+    session.commit()
+
+    changes = get_changes_since(session, since, include_meaningful_meta=True)
+
+    assert len(changes) == 1
+    assert changes[0]["meaningful_change"] is True
+    assert changes[0]["change_kind"] == "deadline_changed"
+
+
+def test_get_changes_since_matches_calendar_refreshes_by_semantic_identity() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    original, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="calendar_event",
+        title="CUESTIONARIO N°1 A PARA RESPONDER cierra",
+        body_text="Mismo evento",
+        published_at=None,
+        starts_at=datetime.now(UTC) + timedelta(days=2),
+        due_at=None,
+        primary_url="https://example.invalid/calendar/export_execute.php",
+        raw_payload={"version": 1},
+    )
+    session.flush()
+    original.updated_at = datetime.now(UTC) - timedelta(hours=2)
+    session.commit()
+
+    refreshed_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="calendar-refresh-2",
+        object_type="calendar_event",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/calendar/export_execute.php",
+        current_hash="hash-refresh-2",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(refreshed_source)
+    session.flush()
+
+    refreshed, _ = upsert_normalized_item(
+        session,
+        source_object_id=refreshed_source.id,
+        course_id=course.id,
+        item_type="calendar_event",
+        title="CUESTIONARIO N°1 A PARA RESPONDER cierra",
+        body_text="Mismo evento",
+        published_at=None,
+        starts_at=original.starts_at,
+        due_at=None,
+        primary_url="https://example.invalid/calendar/export_execute.php",
+        raw_payload={"version": 2},
+    )
+    session.flush()
+    refreshed.updated_at = datetime.now(UTC) - timedelta(minutes=5)
+    session.commit()
+
+    since = datetime.now(UTC) - timedelta(hours=1)
+    changes = get_changes_since(session, since, include_meaningful_meta=True)
+
+    assert len(changes) == 1
+    assert changes[0]["meaningful_change"] is False
+    assert changes[0]["change_kind"] == "refresh_only"
+
+
 def test_build_digest_message_orders_course_blocks_by_soonest_due() -> None:
     session = make_session()
     account = SourceAccount(

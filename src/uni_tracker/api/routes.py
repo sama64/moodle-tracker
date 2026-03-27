@@ -73,7 +73,13 @@ def list_courses() -> list[CourseResponse]:
         ]
 
 
-def _item_response(item: NormalizedItem) -> ItemResponse:
+def _item_response(
+    item: NormalizedItem,
+    *,
+    meaningful_key: str | None = None,
+    meaningful_change: bool | None = None,
+    change_kind: str | None = None,
+) -> ItemResponse:
     return ItemResponse(
         id=item.id,
         course_id=item.course_id,
@@ -87,6 +93,9 @@ def _item_response(item: NormalizedItem) -> ItemResponse:
         review_status=item.review_status,
         review_reason=item.review_reason,
         updated_at=item.updated_at,
+        meaningful_key=meaningful_key,
+        meaningful_change=meaningful_change,
+        change_kind=change_kind,
     )
 
 
@@ -176,7 +185,16 @@ def recent_changes(window_hours: int = 48) -> list[ItemResponse]:
 @router.get("/changes/since", response_model=list[ItemResponse])
 def changes_since(since: datetime) -> list[ItemResponse]:
     with SessionLocal() as session:
-        return [_item_response(item) for item in get_changes_since(session, since=since)]
+        payloads = get_changes_since(session, since=since, include_meaningful_meta=True)
+        return [
+            _item_response(
+                payload["item"],
+                meaningful_key=payload["meaningful_key"],
+                meaningful_change=payload["meaningful_change"],
+                change_kind=payload["change_kind"],
+            )
+            for payload in payloads
+        ]
 
 
 @router.get("/deadlines/upcoming", response_model=list[ItemResponse])
