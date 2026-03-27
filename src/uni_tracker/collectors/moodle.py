@@ -83,7 +83,7 @@ class MoodleCourseCatalogCollector(BaseCollector):
     name = "moodle_courses"
 
     def collect(self, run) -> dict[str, Any]:
-        client = MoodleServiceClient(self.context.settings)
+        client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         try:
             courses = client.get_courses()
         finally:
@@ -163,7 +163,7 @@ class MoodleCourseContentsCollector(BaseCollector):
         courses = self.context.session.scalars(
             select(Course).where(Course.source_account_id == self.context.source_account.id)
         ).all()
-        client = MoodleServiceClient(self.context.settings)
+        client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         processed_courses = 0
         processed_modules = 0
         created_items = 0
@@ -267,7 +267,7 @@ class MoodleCourseUpdatesCollector(BaseCollector):
     name = "moodle_updates"
 
     def collect(self, run) -> dict[str, Any]:
-        client = MoodleServiceClient(self.context.settings)
+        client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         checkpoint = (self.context.source_account.metadata_json or {}).get("last_updates_sync")
         since = (
             datetime.fromisoformat(checkpoint)
@@ -329,7 +329,7 @@ class MoodleForumCollector(BaseCollector):
     name = "moodle_forums"
 
     def collect(self, run) -> dict[str, Any]:
-        client = MoodleServiceClient(self.context.settings)
+        client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         courses = self.context.session.scalars(select(Course).order_by(Course.id)).all()
         course_ids = [int(course.external_id) for course in courses]
         forums = client.get_forums_by_courses(course_ids)
@@ -434,7 +434,7 @@ class MoodleAssignmentsCollector(BaseCollector):
     name = "moodle_assignments"
 
     def collect(self, run) -> dict[str, Any]:
-        client = MoodleServiceClient(self.context.settings)
+        client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         courses = self.context.session.scalars(select(Course).order_by(Course.id)).all()
         payload = client.get_assignments([int(course.external_id) for course in courses])
         relative_path, content_hash, size_bytes = self.context.artifact_store.write_json(
@@ -513,7 +513,7 @@ class MoodleGradesCollector(BaseCollector):
     name = "moodle_grades"
 
     def collect(self, run) -> dict[str, Any]:
-        client = MoodleServiceClient(self.context.settings)
+        client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         processed = 0
         for course in self.context.session.scalars(select(Course).order_by(Course.id)).all():
             payload = client.get_grade_items(int(course.external_id))
@@ -569,7 +569,7 @@ class MoodleCalendarCollector(BaseCollector):
     name = "moodle_calendar"
 
     def collect(self, run) -> dict[str, Any]:
-        client = MoodleServiceClient(self.context.settings)
+        client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         site_info = client.get_site_info()
         export_token = client.get_calendar_export_token()
         ics_text = client.get_calendar_export(user_id=int(site_info["userid"]), export_token=export_token)
@@ -647,7 +647,7 @@ class MoodleFilesCollector(BaseCollector):
     name = "moodle_files"
 
     def collect(self, run) -> dict[str, Any]:
-        client = MoodleServiceClient(self.context.settings)
+        client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         modules = self.context.session.scalars(
             select(SourceObject).where(SourceObject.object_type.in_(["resource", "folder", "page"]))
         ).all()

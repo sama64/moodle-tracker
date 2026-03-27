@@ -31,6 +31,8 @@ class SourceAccount(TimestampMixin, Base):
     auth_health: Mapped[str] = mapped_column(String(50), default="unknown")
     last_auth_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    access_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    access_token_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     courses: Mapped[list["Course"]] = relationship(back_populates="source_account")
 

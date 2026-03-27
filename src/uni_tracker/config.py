@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     moodle_username: str = Field(alias="MOODLE_USERNAME")
     moodle_password: str = Field(alias="MOODLE_PASSWORD")
     moodle_service: str = Field(default="moodle_mobile_app", alias="MOODLE_SERVICE")
+    moodle_token_ttl_seconds: int = Field(default=86400, alias="MOODLE_TOKEN_TTL_SECONDS")
 
     telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str | None = Field(default=None, alias="TELEGRAM_CHAT_ID")

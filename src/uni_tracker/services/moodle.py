@@ -4,13 +4,15 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from typing import Any
 
 import httpx
+from sqlalchemy.orm import Session
 
 from uni_tracker.config import Settings
+from uni_tracker.models import SourceAccount
 
 
 class MoodleError(RuntimeError):
@@ -20,6 +22,8 @@ class MoodleError(RuntimeError):
 @dataclass
 class MoodleServiceClient:
     settings: Settings
+    session: Session | None = None
+    source_account: SourceAccount | None = None
 
     def __post_init__(self) -> None:
         self._token: str | None = None
@@ -34,7 +38,7 @@ class MoodleServiceClient:
 
     def token(self) -> str:
         if self._token is None:
-            self._token = self._fetch_token()
+            self._token = self._load_cached_token() or self._fetch_token()
         return self._token
 
     def call(self, function_name: str, **params: Any) -> Any:
@@ -135,7 +139,34 @@ class MoodleServiceClient:
         token = payload.get("token")
         if not token:
             raise MoodleError(f"Failed to obtain Moodle token: {payload}")
+        self._store_cached_token(str(token))
+        return str(token)
+
+    def _load_cached_token(self) -> str | None:
+        if self.source_account is None:
+            return None
+        token = self.source_account.access_token
+        fetched_at = self.source_account.access_token_fetched_at
+        if not token or fetched_at is None:
+            return None
+        if _normalize_datetime(fetched_at) + timedelta(seconds=self.settings.moodle_token_ttl_seconds) <= datetime.now(UTC):
+            return None
         return token
+
+    def _store_cached_token(self, token: str) -> None:
+        if self.source_account is None or self.session is None:
+            return
+        self.source_account.access_token = token
+        self.source_account.access_token_fetched_at = datetime.now(UTC)
+        self.session.flush()
+
+    def invalidate_cached_token(self) -> None:
+        self._token = None
+        if self.source_account is None or self.session is None:
+            return
+        self.source_account.access_token = None
+        self.source_account.access_token_fetched_at = None
+        self.session.flush()
 
     def _call(self, function_name: str, *, params: dict[str, Any]) -> Any:
         for attempt in range(2):
@@ -150,7 +181,7 @@ class MoodleServiceClient:
             if isinstance(payload, dict) and payload.get("exception"):
                 message = payload.get("message", payload.get("exception"))
                 if payload.get("errorcode") == "invalidtoken" and attempt == 0:
-                    self._token = None
+                    self.invalidate_cached_token()
                     continue
                 raise MoodleError(f"{function_name} failed: {message}")
             return payload
@@ -199,3 +230,9 @@ def _flatten_params(params: dict[str, Any], prefix: str | None = None) -> dict[s
         else:
             flattened[current_key] = value
     return flattened
+
+
+def _normalize_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
