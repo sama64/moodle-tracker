@@ -312,7 +312,7 @@ class MoodleCourseUpdatesCollector(BaseCollector):
                                 if str(module["id"]) in changed_module_ids:
                                     contents_collector._upsert_module(course, module, None)
 
-            metadata = self.context.source_account.metadata_json or {}
+            metadata = dict(self.context.source_account.metadata_json or {})
             metadata["last_updates_sync"] = datetime.now(UTC).isoformat()
             self.context.source_account.metadata_json = metadata
             run.checkpoint = {"since": since.isoformat(), "changed_course_ids": sorted(changed_course_ids)}
@@ -660,7 +660,7 @@ class MoodleFilesCollector(BaseCollector):
                     candidates.append((module, content))
         candidates.sort(key=lambda pair: (pair[0].external_id, pair[1].get("filename") or ""))
         total_candidates = len(candidates)
-        metadata = self.context.source_account.metadata_json or {}
+        metadata = dict(self.context.source_account.metadata_json or {})
         start_index = int(metadata.get("moodle_files_cursor", 0)) if total_candidates else 0
         limit = self.context.settings.file_download_limit_per_run
         batch = candidates[start_index : start_index + limit]
