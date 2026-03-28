@@ -95,6 +95,7 @@ def _item_response(
         primary_url=item.primary_url,
         review_status=item.review_status,
         review_reason=item.review_reason,
+        completion_state=item.completion_state,
         updated_at=item.updated_at,
         meaningful_key=meaningful_key,
         meaningful_change=meaningful_change,

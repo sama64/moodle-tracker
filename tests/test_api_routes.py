@@ -71,6 +71,34 @@ def test_item_content_exposes_declared_file_metadata(monkeypatch) -> None:
     ]
 
 
+def test_get_item_exposes_completion_state(monkeypatch) -> None:
+    session = _make_session()
+    _, course, source_object = _seed_resource(session)
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP 1",
+        body_text="Entrega",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload=source_object.raw_payload,
+        completion_state="completed",
+    )
+    session.commit()
+
+    _install_test_session(monkeypatch, session)
+    client = TestClient(app)
+    response = client.get(f"/items/{item.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["completion_state"] == "completed"
+
+
 def test_item_content_exposes_downloaded_artifact_text(monkeypatch, tmp_path: Path) -> None:
     session = _make_session()
     _, course, source_object = _seed_resource(session)

@@ -145,6 +145,7 @@ class NormalizedItem(TimestampMixin, Base):
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     review_status: Mapped[str] = mapped_column(String(50), default="none")
     review_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    completion_state: Mapped[str] = mapped_column(String(50), default="unknown")
 
     source_object: Mapped["SourceObject"] = relationship(back_populates="normalized_items")
     versions: Mapped[list["ItemVersion"]] = relationship(back_populates="normalized_item")

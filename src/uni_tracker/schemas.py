@@ -44,6 +44,7 @@ class ItemResponse(BaseModel):
     primary_url: str | None
     review_status: str
     review_reason: str | None
+    completion_state: str
     updated_at: datetime
     meaningful_key: str | None = None
     meaningful_change: bool | None = None

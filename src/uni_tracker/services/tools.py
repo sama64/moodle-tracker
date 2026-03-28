@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 from uni_tracker.config import get_settings
 from uni_tracker.models import Course, ItemFact, NormalizedItem, Notification, RawArtifact, SourceObject
 
+ACTIONABLE_COMPLETION_ITEM_TYPES = {"assignment", "quiz"}
+
 
 def get_recent_changes(session: Session, window_hours: int = 48) -> list[NormalizedItem]:
     since = datetime.now(UTC) - timedelta(hours=window_hours)
@@ -67,15 +69,18 @@ def get_changes_since(
 def get_upcoming_deadlines(session: Session, days: int = 10) -> list[NormalizedItem]:
     now = datetime.now(UTC)
     end = now + timedelta(days=days)
-    return session.scalars(
+    items = session.scalars(
         select(NormalizedItem)
         .where(
+            NormalizedItem.status == "active",
             NormalizedItem.due_at.is_not(None),
             NormalizedItem.due_at >= now,
             NormalizedItem.due_at <= end,
         )
         .order_by(NormalizedItem.due_at)
     ).all()
+    completed_keys = _completed_identity_keys(items)
+    return [item for item in items if not _is_completed_or_shadowed(item, completed_keys)]
 
 
 def get_risk_items(session: Session, days: int = 14) -> list[NormalizedItem]:
@@ -85,7 +90,12 @@ def get_risk_items(session: Session, days: int = 14) -> list[NormalizedItem]:
         select(NormalizedItem)
         .order_by(NormalizedItem.updated_at.desc())
     ).all()
-    filtered = [item for item in items if _is_risk_item(item, now=now, end=end)]
+    completed_keys = _completed_identity_keys(items)
+    filtered = [
+        item
+        for item in items
+        if not _is_completed_or_shadowed(item, completed_keys) and _is_risk_item(item, now=now, end=end)
+    ]
     grouped: dict[tuple[int | None, str], NormalizedItem] = {}
     for item in filtered:
         key = (item.course_id, _risk_title(item))
@@ -219,6 +229,8 @@ def get_change_kind(item: NormalizedItem, previous: NormalizedItem | None) -> st
 
 
 def _is_risk_item(item: NormalizedItem, *, now: datetime, end: datetime) -> bool:
+    if item.status != "active":
+        return False
     due_at = _normalize_datetime(item.due_at)
     if due_at is not None and now <= due_at <= end:
         return True
@@ -263,6 +275,27 @@ def _risk_title(item: NormalizedItem) -> str:
                 title = title[: -len(suffix)].strip()
                 break
     return title
+
+
+def _completed_identity_keys(items: list[NormalizedItem]) -> set[tuple[int | None, str]]:
+    return {
+        (item.course_id, _risk_title(item))
+        for item in items
+        if item.status == "active"
+        and item.completion_state == "completed"
+        and item.item_type in ACTIONABLE_COMPLETION_ITEM_TYPES
+    }
+
+
+def _is_completed_or_shadowed(
+    item: NormalizedItem,
+    completed_keys: set[tuple[int | None, str]],
+) -> bool:
+    if item.completion_state == "completed":
+        return True
+    if item.item_type not in ACTIONABLE_COMPLETION_ITEM_TYPES | {"calendar_event"}:
+        return False
+    return (item.course_id, _risk_title(item)) in completed_keys
 
 
 def resolve_item_course(session: Session, item: NormalizedItem) -> Course | None:

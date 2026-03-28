@@ -55,7 +55,9 @@ def schedule_notifications_for_item(
     item: NormalizedItem,
     change: ItemChange | None = None,
 ) -> None:
-    if item.status != "active":
+    if item.status != "active" or item.completion_state == "completed":
+        return
+    if change is not None and change.changed_fields and set(change.changed_fields) <= {"completion_state"}:
         return
 
     now = datetime.now(UTC)
@@ -198,6 +200,11 @@ def dispatch_due_notifications(session: Session) -> dict[str, int]:
                 if item is None:
                     notification.sent_at = now
                     notification.delivery_error = "missing_item"
+                    skipped += 1
+                    continue
+                if item.completion_state == "completed":
+                    notification.sent_at = now
+                    notification.delivery_error = "completed_before_send"
                     skipped += 1
                     continue
                 text = build_urgent_message(item, notification)
