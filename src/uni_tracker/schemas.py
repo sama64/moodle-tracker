@@ -50,6 +50,29 @@ class ItemResponse(BaseModel):
     change_kind: str | None = None
 
 
+class ItemArtifactResponse(BaseModel):
+    source_object_id: int | None
+    parent_source_object_id: int | None
+    filename: str
+    filepath: str | None
+    item_id: int | None
+    item_type: str | None
+    mime_type: str | None
+    source_url: str | None
+    file_artifact_id: int | None
+    extracted_text_artifact_id: int | None
+    storage_path: str | None
+    size_bytes: int | None
+    downloaded: bool
+    extracted_text: str | None
+    extraction_status: str
+
+
+class ItemContentResponse(BaseModel):
+    item: ItemResponse
+    artifacts: list[ItemArtifactResponse]
+
+
 class ProvenanceFactResponse(BaseModel):
     fact_type: str
     value_json: dict

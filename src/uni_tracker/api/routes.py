@@ -14,7 +14,9 @@ from uni_tracker.schemas import (
     CourseResponse,
     HealthSnapshotResponse,
     HealthResponse,
+    ItemContentResponse,
     ItemBriefResponse,
+    ItemArtifactResponse,
     ItemProvenanceResponse,
     ItemResponse,
     NotificationResponse,
@@ -29,6 +31,7 @@ from uni_tracker.services.sync import COLLECTOR_REGISTRY, run_collector
 from uni_tracker.services.tools import (
     get_course_snapshot,
     get_changes_since,
+    get_item_artifacts,
     get_item_provenance,
     get_recent_changes,
     get_risk_items,
@@ -163,6 +166,21 @@ def item_provenance(item_id: int) -> ItemProvenanceResponse:
                     delivery_error=notification.delivery_error,
                 )
                 for notification in payload["notifications"]
+            ],
+        )
+
+
+@router.get("/items/{item_id}/content", response_model=ItemContentResponse)
+def item_content(item_id: int) -> ItemContentResponse:
+    with SessionLocal() as session:
+        payload = get_item_artifacts(session, item_id)
+        if not payload:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return ItemContentResponse(
+            item=_item_response(payload["item"]),
+            artifacts=[
+                ItemArtifactResponse(**artifact)
+                for artifact in payload["artifacts"]
             ],
         )
 
