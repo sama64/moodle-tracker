@@ -18,6 +18,7 @@ services:
       PYTHONPATH: /app/src
     volumes:
       - ./data/uni-tracker:/app/data/uni-tracker
+      - ./data/uni-tracker/artifacts/runtime:/app/artifacts/runtime
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -35,6 +36,7 @@ services:
       PYTHONPATH: /app/src
     volumes:
       - ./data/uni-tracker:/app/data/uni-tracker
+      - ./data/uni-tracker/artifacts/runtime:/app/artifacts/runtime
     depends_on:
       - db
     command: >
