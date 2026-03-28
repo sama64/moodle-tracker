@@ -649,7 +649,7 @@ class MoodleFilesCollector(BaseCollector):
     def collect(self, run) -> dict[str, Any]:
         client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         modules = self.context.session.scalars(
-            select(SourceObject).where(SourceObject.object_type.in_(["resource", "folder", "page"]))
+            select(SourceObject).where(SourceObject.object_type.in_(["resource", "folder", "page", "assign"]))
         ).all()
         candidates: list[tuple[SourceObject, dict[str, Any]]] = []
         for module in modules:
