@@ -16,10 +16,11 @@ from uni_tracker.services.notifications import (
     schedule_notifications_for_item,
 )
 from uni_tracker.services.briefs import get_item_brief, upsert_item_brief
+from uni_tracker.services.completion import set_completion_override
 from uni_tracker.services.llm import backfill_item_briefs, enrich_recent_items
 from uni_tracker.services.persistence import ItemChange, upsert_normalized_item
 from uni_tracker.services.telegram_bot import poll_telegram_commands
-from uni_tracker.services.tools import get_changes_since, get_item_course_name, get_risk_items
+from uni_tracker.services.tools import get_changes_since, get_item_course_name, get_risk_items, get_upcoming_deadlines
 
 
 def make_session() -> Session:
@@ -655,6 +656,213 @@ def test_get_risk_items_places_schedule_docs_after_due_items() -> None:
     risks = get_risk_items(session)
     titles = [item.title for item in risks if item.title in {"TP C", "Programa analítico Cálculo I.pdf"}]
     assert titles == ["TP C", "Programa analítico Cálculo I.pdf"]
+
+
+def test_get_upcoming_deadlines_excludes_completed_items() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    completed_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="done-assignment",
+        object_type="assign",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/done",
+        current_hash="hash-done",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(completed_source)
+    session.flush()
+    upsert_normalized_item(
+        session,
+        source_object_id=completed_source.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP Entregado",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=2),
+        primary_url=completed_source.source_url,
+        raw_payload={},
+        completion_state="completed",
+    )
+
+    pending_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="pending-assignment",
+        object_type="assign",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/pending",
+        current_hash="hash-pending",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(pending_source)
+    session.flush()
+    upsert_normalized_item(
+        session,
+        source_object_id=pending_source.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP Pendiente",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=3),
+        primary_url=pending_source.source_url,
+        raw_payload={},
+        completion_state="incomplete",
+    )
+    session.commit()
+
+    deadlines = get_upcoming_deadlines(session)
+
+    assert [item.title for item in deadlines] == ["TP Pendiente"]
+
+
+def test_get_risk_items_excludes_completed_items_and_mirrored_calendar_entries() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    quiz_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="quiz-completed",
+        object_type="quiz",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/quiz/1",
+        current_hash="hash-quiz",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(quiz_source)
+    session.flush()
+    upsert_normalized_item(
+        session,
+        source_object_id=quiz_source.id,
+        course_id=course.id,
+        item_type="quiz",
+        title="Cuestionario 1",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=1),
+        primary_url=quiz_source.source_url,
+        raw_payload={},
+        completion_state="completed",
+    )
+
+    calendar_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="calendar-quiz",
+        object_type="calendar_event",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/calendar",
+        current_hash="hash-calendar",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(calendar_source)
+    session.flush()
+    upsert_normalized_item(
+        session,
+        source_object_id=calendar_source.id,
+        course_id=course.id,
+        item_type="calendar_event",
+        title="Cuestionario 1 cierra",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=1),
+        primary_url=calendar_source.source_url,
+        raw_payload={},
+    )
+
+    pending_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="assignment-pending",
+        object_type="assign",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/assignment/2",
+        current_hash="hash-pending-2",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(pending_source)
+    session.flush()
+    upsert_normalized_item(
+        session,
+        source_object_id=pending_source.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP Activo",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=2),
+        primary_url=pending_source.source_url,
+        raw_payload={},
+        completion_state="incomplete",
+    )
+    session.commit()
+
+    risks = get_risk_items(session)
+
+    assert [item.title for item in risks if item.title in {"Cuestionario 1", "Cuestionario 1 cierra", "TP Activo"}] == ["TP Activo"]
+
+
+def test_manual_completion_override_excludes_item_from_deadlines_and_risks() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    quiz_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="quiz-override",
+        object_type="quiz",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/quiz/override",
+        current_hash="hash-quiz-override",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(quiz_source)
+    session.flush()
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=quiz_source.id,
+        course_id=course.id,
+        item_type="quiz",
+        title="Cuestionario 2",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=1),
+        primary_url=quiz_source.source_url,
+        raw_payload={},
+        completion_state="incomplete",
+    )
+    session.flush()
+    set_completion_override(session, item.id, override_state="completed")
+    session.commit()
+
+    deadlines = get_upcoming_deadlines(session)
+    risks = get_risk_items(session)
+
+    assert "Cuestionario 2" not in [entry.title for entry in deadlines]
+    assert "Cuestionario 2" not in [entry.title for entry in risks]
 
 
 def test_poll_telegram_commands_sends_digest_on_demand(monkeypatch) -> None:

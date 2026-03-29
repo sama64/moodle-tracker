@@ -23,6 +23,7 @@ from uni_tracker.schemas import (
     ProvenanceFactResponse,
     SyncResult,
 )
+from uni_tracker.services.completion import effective_completion_state, set_completion_override
 from uni_tracker.services.briefs import get_course_brief, get_item_brief
 from uni_tracker.services.health import get_health_snapshot
 from uni_tracker.services.notifications import acknowledge_item, dispatch_due_notifications, schedule_daily_digest
@@ -95,6 +96,9 @@ def _item_response(
         primary_url=item.primary_url,
         review_status=item.review_status,
         review_reason=item.review_reason,
+        completion_state=effective_completion_state(item),
+        source_completion_state=item.completion_state,
+        completion_override_state=item.completion_override_state,
         updated_at=item.updated_at,
         meaningful_key=meaningful_key,
         meaningful_change=meaningful_change,
@@ -275,6 +279,28 @@ def acknowledge(item_id: int) -> AcknowledgeResponse:
             raise HTTPException(status_code=404, detail="Item not found")
         session.commit()
         return AcknowledgeResponse(ok=True)
+
+
+@router.post("/items/{item_id}/done", response_model=ItemResponse)
+def mark_item_done(item_id: int) -> ItemResponse:
+    with SessionLocal() as session:
+        item = set_completion_override(session, item_id, override_state="completed")
+        if item is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        session.commit()
+        session.refresh(item)
+        return _item_response(item)
+
+
+@router.delete("/items/{item_id}/done", response_model=ItemResponse)
+def clear_item_done(item_id: int) -> ItemResponse:
+    with SessionLocal() as session:
+        item = set_completion_override(session, item_id, override_state=None)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Item not found")
+        session.commit()
+        session.refresh(item)
+        return _item_response(item)
 
 
 @router.post("/sync/run/{collector_name}", response_model=SyncResult)

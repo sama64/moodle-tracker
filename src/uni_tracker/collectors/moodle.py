@@ -9,7 +9,7 @@ from sqlalchemy import select
 from uni_tracker.collectors.base import BaseCollector
 from uni_tracker.models import Course, ItemFact, NormalizedItem, SourceObject
 from uni_tracker.services.calendar import parse_ics_events
-from uni_tracker.services.moodle import MoodleServiceClient, epoch_to_datetime
+from uni_tracker.services.moodle import MoodleError, MoodleServiceClient, epoch_to_datetime
 from uni_tracker.services.notifications import schedule_notifications_for_item
 from uni_tracker.services.parsing import (
     ExtractedFact,
@@ -39,6 +39,10 @@ MODULE_TO_ITEM_TYPE = {
     "url": "material",
     "label": "material",
 }
+
+COMPLETION_STATE_UNKNOWN = "unknown"
+COMPLETION_STATE_INCOMPLETE = "incomplete"
+COMPLETION_STATE_COMPLETED = "completed"
 
 
 def module_item_type(modname: str) -> str:
@@ -77,6 +81,95 @@ def extract_module_date_facts(module: dict[str, Any]) -> tuple[datetime | None, 
 
 def forum_item_type(forum_type: str) -> str:
     return "announcement" if forum_type == "news" else "forum_discussion"
+
+
+def extract_module_completion_state(module: dict[str, Any]) -> str:
+    completion = module.get("completiondata") or {}
+    if not isinstance(completion, dict) or not completion:
+        return COMPLETION_STATE_UNKNOWN
+    if not completion.get("hascompletion"):
+        return COMPLETION_STATE_UNKNOWN
+    if completion.get("isoverallcomplete") is True:
+        return COMPLETION_STATE_COMPLETED
+    state = completion.get("state")
+    if isinstance(state, int):
+        return COMPLETION_STATE_COMPLETED if state > 0 else COMPLETION_STATE_INCOMPLETE
+    return COMPLETION_STATE_UNKNOWN
+
+
+def extract_assignment_completion_state(
+    assignment: dict[str, Any],
+    submission_status: dict[str, Any] | None,
+) -> str:
+    if not submission_status:
+        return COMPLETION_STATE_UNKNOWN
+
+    last_attempt = submission_status.get("lastattempt") or {}
+    submission = last_attempt.get("submission") or {}
+    grading_summary = submission_status.get("gradingsummary") or {}
+    submission_value = str(submission.get("status") or "").lower()
+    grading_statuses = {
+        str(submission.get("gradingstatus") or "").lower(),
+        str(grading_summary.get("gradingstatus") or "").lower(),
+    }
+
+    if submission_value in {"submitted", "graded"}:
+        return COMPLETION_STATE_COMPLETED
+    if last_attempt.get("submitted") is True or submission.get("submitted") is True:
+        return COMPLETION_STATE_COMPLETED
+    if grading_statuses & {"graded", "released"}:
+        return COMPLETION_STATE_COMPLETED
+    if int(assignment.get("completionsubmit") or 0) == 1 or last_attempt or submission or grading_summary:
+        return COMPLETION_STATE_INCOMPLETE
+    return COMPLETION_STATE_UNKNOWN
+
+
+def extract_quiz_completion_state(
+    module: dict[str, Any],
+    attempts_payload: dict[str, Any] | None,
+) -> str:
+    if attempts_payload:
+        attempts = attempts_payload.get("attempts") or []
+        if isinstance(attempts, list):
+            non_preview_attempts = [
+                attempt for attempt in attempts if not bool((attempt or {}).get("preview"))
+            ]
+            if any(str((attempt or {}).get("state") or "").lower() == "finished" for attempt in non_preview_attempts):
+                return COMPLETION_STATE_COMPLETED
+            if non_preview_attempts:
+                return COMPLETION_STATE_INCOMPLETE
+    return extract_module_completion_state(module)
+
+
+def load_assignment_submission_status(
+    client: MoodleServiceClient | None,
+    assign_instance_id: int | None,
+) -> dict[str, Any] | None:
+    if client is None or assign_instance_id is None:
+        return None
+    try:
+        return client.get_assignment_submission_status(assign_instance_id)
+    except MoodleError:
+        return None
+
+
+def load_quiz_attempts(
+    client: MoodleServiceClient | None,
+    quiz_instance_id: int | None,
+) -> dict[str, Any] | None:
+    if client is None or quiz_instance_id is None:
+        return None
+    try:
+        return client.get_quiz_user_attempts(quiz_instance_id, status="all")
+    except MoodleError:
+        return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class MoodleCourseCatalogCollector(BaseCollector):
@@ -201,7 +294,7 @@ class MoodleCourseContentsCollector(BaseCollector):
                 for section in contents:
                     for module in section.get("modules", []):
                         live_external_ids.add(str(module["id"]))
-                        changed = self._upsert_module(course, module, artifact.id)
+                        changed = self._upsert_module(course, module, artifact.id, client=client)
                         processed_modules += 1
                         if changed == "created":
                             created_items += 1
@@ -226,16 +319,37 @@ class MoodleCourseContentsCollector(BaseCollector):
         finally:
             client.close()
 
-    def _upsert_module(self, course: Course, module: dict[str, Any], source_artifact_id: int) -> str:
+    def _upsert_module(
+        self,
+        course: Course,
+        module: dict[str, Any],
+        source_artifact_id: int | None,
+        *,
+        client: MoodleServiceClient | None,
+    ) -> str:
+        modname = module.get("modname", "module")
+        raw_payload = dict(module)
+        completion_state = COMPLETION_STATE_UNKNOWN
+        if modname == "quiz":
+            attempts_payload = load_quiz_attempts(client, _coerce_int(module.get("instance")))
+            if attempts_payload is not None:
+                raw_payload["user_attempts"] = attempts_payload
+            completion_state = extract_quiz_completion_state(module, attempts_payload)
+        elif modname == "assign":
+            submission_status = load_assignment_submission_status(client, _coerce_int(module.get("instance")))
+            if submission_status is not None:
+                raw_payload["submission_status"] = submission_status
+            completion_state = extract_assignment_completion_state(module, submission_status)
+
         source_object, _ = upsert_source_object(
             self.context.session,
             source_account_id=self.context.source_account.id,
             external_id=str(module["id"]),
-            object_type=module.get("modname", "module"),
+            object_type=modname,
             course_id=course.id,
             parent_external_id=course.external_id,
             source_url=module.get("url"),
-            raw_payload=module,
+            raw_payload=raw_payload,
         )
         due_at, starts_at, facts = extract_module_date_facts(module)
         body_text = strip_html(module.get("description"))
@@ -250,7 +364,8 @@ class MoodleCourseContentsCollector(BaseCollector):
             starts_at=starts_at,
             due_at=due_at,
             primary_url=module.get("url"),
-            raw_payload=module,
+            raw_payload=raw_payload,
+            completion_state=completion_state,
             source_artifact_id=source_artifact_id,
             facts_payload=[
                 {"fact_type": fact.fact_type, "value": fact.value, "extractor_type": fact.extractor_type}
@@ -310,7 +425,7 @@ class MoodleCourseUpdatesCollector(BaseCollector):
                         for section in contents:
                             for module in section.get("modules", []):
                                 if str(module["id"]) in changed_module_ids:
-                                    contents_collector._upsert_module(course, module, None)
+                                    contents_collector._upsert_module(course, module, None, client=client)
 
             metadata = dict(self.context.source_account.metadata_json or {})
             metadata["last_updates_sync"] = datetime.now(UTC).isoformat()
@@ -462,6 +577,10 @@ class MoodleAssignmentsCollector(BaseCollector):
             if course is None:
                 continue
             for assignment in course_payload.get("assignments", []):
+                submission_status = load_assignment_submission_status(client, _coerce_int(assignment.get("id")))
+                raw_payload = dict(assignment)
+                if submission_status is not None:
+                    raw_payload["submission_status"] = submission_status
                 source_object, _ = upsert_source_object(
                     self.context.session,
                     source_account_id=self.context.source_account.id,
@@ -470,7 +589,7 @@ class MoodleAssignmentsCollector(BaseCollector):
                     course_id=course.id,
                     parent_external_id=course.external_id,
                     source_url=f"{self.context.settings.moodle_base_url}/mod/assign/view.php?id={assignment['cmid']}",
-                    raw_payload=assignment,
+                    raw_payload=raw_payload,
                 )
                 body_text = strip_html(assignment.get("intro"))
                 facts = extract_date_facts_from_text(body_text or "")
@@ -495,7 +614,8 @@ class MoodleAssignmentsCollector(BaseCollector):
                     starts_at=epoch_to_datetime(int(assignment["allowsubmissionsfromdate"])) if assignment.get("allowsubmissionsfromdate") else None,
                     due_at=epoch_to_datetime(int(assignment["duedate"])) if assignment.get("duedate") else None,
                     primary_url=source_object.source_url,
-                    raw_payload=assignment,
+                    raw_payload=raw_payload,
+                    completion_state=extract_assignment_completion_state(assignment, submission_status),
                     facts_payload=[
                         {"fact_type": fact.fact_type, "value": fact.value, "extractor_type": fact.extractor_type}
                         for fact in facts

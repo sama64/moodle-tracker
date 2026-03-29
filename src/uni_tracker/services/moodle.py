@@ -94,6 +94,18 @@ class MoodleServiceClient:
             raise MoodleError("Unexpected assignments payload.")
         return payload
 
+    def get_assignment_submission_status(self, assign_id: int) -> dict[str, Any]:
+        payload = self.call("mod_assign_get_submission_status", assignid=assign_id)
+        if not isinstance(payload, dict):
+            raise MoodleError(f"Unexpected submission status payload for assignment {assign_id}.")
+        return payload
+
+    def get_quiz_user_attempts(self, quiz_id: int, *, status: str = "all") -> dict[str, Any]:
+        payload = self.call("mod_quiz_get_user_attempts", quizid=quiz_id, status=status)
+        if not isinstance(payload, dict):
+            raise MoodleError(f"Unexpected user attempts payload for quiz {quiz_id}.")
+        return payload
+
     def get_grade_items(self, course_id: int) -> dict[str, Any]:
         payload = self.call("core_grades_get_gradeitems", courseid=course_id)
         if not isinstance(payload, dict):

@@ -8,7 +8,13 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from uni_tracker.collectors.base import CollectorContext
-from uni_tracker.collectors.moodle import MoodleFilesCollector
+from uni_tracker.collectors.moodle import (
+    COMPLETION_STATE_COMPLETED,
+    COMPLETION_STATE_INCOMPLETE,
+    COMPLETION_STATE_UNKNOWN,
+    MoodleFilesCollector,
+    extract_quiz_completion_state,
+)
 from uni_tracker.db import Base
 from uni_tracker.models import Course, SourceAccount, SourceObject
 from uni_tracker.services.storage import ArtifactStore
@@ -115,3 +121,50 @@ def test_moodle_files_cursor_persists_between_runs(monkeypatch, tmp_path) -> Non
         "https://example.invalid/pluginfile.php/1/archivo-1.pdf",
         "https://example.invalid/pluginfile.php/2/archivo-2.pdf",
     ]
+
+
+def test_extract_quiz_completion_state_prefers_finished_attempts() -> None:
+    module = {
+        "completiondata": {
+            "state": 0,
+            "hascompletion": True,
+            "isoverallcomplete": False,
+        }
+    }
+    attempts_payload = {
+        "attempts": [
+            {"preview": 0, "state": "finished"},
+        ]
+    }
+
+    assert extract_quiz_completion_state(module, attempts_payload) == COMPLETION_STATE_COMPLETED
+
+
+def test_extract_quiz_completion_state_marks_started_quiz_incomplete() -> None:
+    module = {
+        "completiondata": {
+            "state": 0,
+            "hascompletion": True,
+            "isoverallcomplete": False,
+        }
+    }
+    attempts_payload = {
+        "attempts": [
+            {"preview": 0, "state": "inprogress"},
+        ]
+    }
+
+    assert extract_quiz_completion_state(module, attempts_payload) == COMPLETION_STATE_INCOMPLETE
+
+
+def test_extract_quiz_completion_state_falls_back_to_module_completion() -> None:
+    module = {
+        "completiondata": {
+            "state": 1,
+            "hascompletion": True,
+            "isoverallcomplete": True,
+        }
+    }
+
+    assert extract_quiz_completion_state(module, None) == COMPLETION_STATE_COMPLETED
+    assert extract_quiz_completion_state({}, None) == COMPLETION_STATE_UNKNOWN

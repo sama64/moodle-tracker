@@ -115,6 +115,7 @@ def upsert_normalized_item(
     raw_payload: dict[str, Any],
     review_status: str = "none",
     review_reason: str | None = None,
+    completion_state: str = "unknown",
     source_artifact_id: int | None = None,
     facts_payload: list[dict[str, Any]] | None = None,
 ) -> tuple[NormalizedItem, ItemChange]:
@@ -128,6 +129,7 @@ def upsert_normalized_item(
         "primary_url": primary_url,
         "review_status": review_status,
         "review_reason": review_reason,
+        "completion_state": completion_state,
         "item_type": item_type,
         "facts_payload": facts_payload,
     }
@@ -155,6 +157,7 @@ def upsert_normalized_item(
             raw_payload=raw_payload,
             review_status=review_status,
             review_reason=review_reason,
+            completion_state=completion_state,
         )
         session.add(item)
         session.flush()
@@ -170,6 +173,7 @@ def upsert_normalized_item(
         item.raw_payload = raw_payload
         item.review_status = review_status
         item.review_reason = review_reason
+        item.completion_state = completion_state
         return item, ItemChange(
             state="unchanged",
             change_type="unchanged",
@@ -187,6 +191,7 @@ def upsert_normalized_item(
         "primary_url": item.primary_url,
         "review_status": item.review_status,
         "review_reason": item.review_reason,
+        "completion_state": item.completion_state,
         "item_type": item.item_type,
         "facts_payload": _serialize_fact_payload(
             [
@@ -214,6 +219,7 @@ def upsert_normalized_item(
     item.raw_payload = raw_payload
     item.review_status = review_status
     item.review_reason = review_reason
+    item.completion_state = completion_state
     session.flush()
 
     version_number = len(item.versions) + 1
