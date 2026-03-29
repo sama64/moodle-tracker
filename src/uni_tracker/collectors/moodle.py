@@ -124,6 +124,23 @@ def extract_assignment_completion_state(
     return COMPLETION_STATE_UNKNOWN
 
 
+def extract_quiz_completion_state(
+    module: dict[str, Any],
+    attempts_payload: dict[str, Any] | None,
+) -> str:
+    if attempts_payload:
+        attempts = attempts_payload.get("attempts") or []
+        if isinstance(attempts, list):
+            non_preview_attempts = [
+                attempt for attempt in attempts if not bool((attempt or {}).get("preview"))
+            ]
+            if any(str((attempt or {}).get("state") or "").lower() == "finished" for attempt in non_preview_attempts):
+                return COMPLETION_STATE_COMPLETED
+            if non_preview_attempts:
+                return COMPLETION_STATE_INCOMPLETE
+    return extract_module_completion_state(module)
+
+
 def load_assignment_submission_status(
     client: MoodleServiceClient | None,
     assign_instance_id: int | None,
@@ -132,6 +149,18 @@ def load_assignment_submission_status(
         return None
     try:
         return client.get_assignment_submission_status(assign_instance_id)
+    except MoodleError:
+        return None
+
+
+def load_quiz_attempts(
+    client: MoodleServiceClient | None,
+    quiz_instance_id: int | None,
+) -> dict[str, Any] | None:
+    if client is None or quiz_instance_id is None:
+        return None
+    try:
+        return client.get_quiz_user_attempts(quiz_instance_id, status="all")
     except MoodleError:
         return None
 
@@ -302,7 +331,10 @@ class MoodleCourseContentsCollector(BaseCollector):
         raw_payload = dict(module)
         completion_state = COMPLETION_STATE_UNKNOWN
         if modname == "quiz":
-            completion_state = extract_module_completion_state(module)
+            attempts_payload = load_quiz_attempts(client, _coerce_int(module.get("instance")))
+            if attempts_payload is not None:
+                raw_payload["user_attempts"] = attempts_payload
+            completion_state = extract_quiz_completion_state(module, attempts_payload)
         elif modname == "assign":
             submission_status = load_assignment_submission_status(client, _coerce_int(module.get("instance")))
             if submission_status is not None:
