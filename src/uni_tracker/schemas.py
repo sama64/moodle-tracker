@@ -45,6 +45,8 @@ class ItemResponse(BaseModel):
     review_status: str
     review_reason: str | None
     completion_state: str
+    source_completion_state: str | None = None
+    completion_override_state: str | None = None
     updated_at: datetime
     meaningful_key: str | None = None
     meaningful_change: bool | None = None

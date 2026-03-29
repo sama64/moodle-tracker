@@ -16,6 +16,7 @@ from uni_tracker.services.notifications import (
     schedule_notifications_for_item,
 )
 from uni_tracker.services.briefs import get_item_brief, upsert_item_brief
+from uni_tracker.services.completion import set_completion_override
 from uni_tracker.services.llm import backfill_item_briefs, enrich_recent_items
 from uni_tracker.services.persistence import ItemChange, upsert_normalized_item
 from uni_tracker.services.telegram_bot import poll_telegram_commands
@@ -819,6 +820,49 @@ def test_get_risk_items_excludes_completed_items_and_mirrored_calendar_entries()
     risks = get_risk_items(session)
 
     assert [item.title for item in risks if item.title in {"Cuestionario 1", "Cuestionario 1 cierra", "TP Activo"}] == ["TP Activo"]
+
+
+def test_manual_completion_override_excludes_item_from_deadlines_and_risks() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    quiz_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="quiz-override",
+        object_type="quiz",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/quiz/override",
+        current_hash="hash-quiz-override",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(quiz_source)
+    session.flush()
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=quiz_source.id,
+        course_id=course.id,
+        item_type="quiz",
+        title="Cuestionario 2",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=1),
+        primary_url=quiz_source.source_url,
+        raw_payload={},
+        completion_state="incomplete",
+    )
+    session.flush()
+    set_completion_override(session, item.id, override_state="completed")
+    session.commit()
+
+    deadlines = get_upcoming_deadlines(session)
+    risks = get_risk_items(session)
+
+    assert "Cuestionario 2" not in [entry.title for entry in deadlines]
+    assert "Cuestionario 2" not in [entry.title for entry in risks]
 
 
 def test_poll_telegram_commands_sends_digest_on_demand(monkeypatch) -> None:

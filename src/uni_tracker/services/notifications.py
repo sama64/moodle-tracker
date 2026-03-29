@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from uni_tracker.config import get_settings
 from uni_tracker.models import Acknowledgement, ItemVersion, NormalizedItem, Notification
+from uni_tracker.services.completion import is_completed
 from uni_tracker.services.parsing import strip_html
 from uni_tracker.services.persistence import ItemChange
 from uni_tracker.services.timeutils import format_local_date, format_local_date_time, format_local_datetime
@@ -55,7 +56,7 @@ def schedule_notifications_for_item(
     item: NormalizedItem,
     change: ItemChange | None = None,
 ) -> None:
-    if item.status != "active" or item.completion_state == "completed":
+    if item.status != "active" or is_completed(item):
         return
     if change is not None and change.changed_fields and set(change.changed_fields) <= {"completion_state"}:
         return
@@ -202,7 +203,7 @@ def dispatch_due_notifications(session: Session) -> dict[str, int]:
                     notification.delivery_error = "missing_item"
                     skipped += 1
                     continue
-                if item.completion_state == "completed":
+                if is_completed(item):
                     notification.sent_at = now
                     notification.delivery_error = "completed_before_send"
                     skipped += 1
@@ -394,6 +395,8 @@ def _digest_bucket(item: NormalizedItem, version: ItemVersion | None, since: dat
         return "urgent_changes"
 
     if item.status != "active":
+        return "materials"
+    if is_completed(item):
         return "materials"
 
     now = datetime.now(UTC)

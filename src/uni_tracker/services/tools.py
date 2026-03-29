@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from uni_tracker.config import get_settings
 from uni_tracker.models import Course, ItemFact, NormalizedItem, Notification, RawArtifact, SourceObject
+from uni_tracker.services.completion import is_completed
 
 ACTIONABLE_COMPLETION_ITEM_TYPES = {"assignment", "quiz"}
 
@@ -282,7 +283,7 @@ def _completed_identity_keys(items: list[NormalizedItem]) -> set[tuple[int | Non
         (item.course_id, _risk_title(item))
         for item in items
         if item.status == "active"
-        and item.completion_state == "completed"
+        and is_completed(item)
         and item.item_type in ACTIONABLE_COMPLETION_ITEM_TYPES
     }
 
@@ -291,7 +292,7 @@ def _is_completed_or_shadowed(
     item: NormalizedItem,
     completed_keys: set[tuple[int | None, str]],
 ) -> bool:
-    if item.completion_state == "completed":
+    if is_completed(item):
         return True
     if item.item_type not in ACTIONABLE_COMPLETION_ITEM_TYPES | {"calendar_event"}:
         return False

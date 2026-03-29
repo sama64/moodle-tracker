@@ -97,6 +97,69 @@ def test_get_item_exposes_completion_state(monkeypatch) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["completion_state"] == "completed"
+    assert payload["source_completion_state"] == "completed"
+    assert payload["completion_override_state"] is None
+
+
+def test_mark_item_done_sets_completion_override(monkeypatch) -> None:
+    session = _make_session()
+    _, course, source_object = _seed_resource(session)
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="quiz",
+        title="Cuestionario 2",
+        body_text="Entrega",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload=source_object.raw_payload,
+        completion_state="incomplete",
+    )
+    session.commit()
+
+    _install_test_session(monkeypatch, session)
+    client = TestClient(app)
+    response = client.post(f"/items/{item.id}/done")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["completion_state"] == "completed"
+    assert payload["source_completion_state"] == "incomplete"
+    assert payload["completion_override_state"] == "completed"
+
+
+def test_clear_item_done_removes_completion_override(monkeypatch) -> None:
+    session = _make_session()
+    _, course, source_object = _seed_resource(session)
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="quiz",
+        title="Cuestionario 2",
+        body_text="Entrega",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload=source_object.raw_payload,
+        completion_state="incomplete",
+    )
+    item.completion_override_state = "completed"
+    session.commit()
+
+    _install_test_session(monkeypatch, session)
+    client = TestClient(app)
+    response = client.delete(f"/items/{item.id}/done")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["completion_state"] == "incomplete"
+    assert payload["source_completion_state"] == "incomplete"
+    assert payload["completion_override_state"] is None
 
 
 def test_item_content_exposes_downloaded_artifact_text(monkeypatch, tmp_path: Path) -> None:
