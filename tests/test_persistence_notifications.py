@@ -18,7 +18,8 @@ from uni_tracker.services.notifications import (
 from uni_tracker.services.briefs import get_item_brief, upsert_item_brief
 from uni_tracker.services.completion import set_completion_override
 from uni_tracker.services.llm import backfill_item_briefs, enrich_recent_items
-from uni_tracker.services.persistence import ItemChange, upsert_normalized_item
+from uni_tracker.services.parsing import ExtractedFact
+from uni_tracker.services.persistence import ItemChange, replace_item_facts, upsert_normalized_item
 from uni_tracker.services.telegram_bot import poll_telegram_commands
 from uni_tracker.services.tools import get_changes_since, get_item_course_name, get_risk_items, get_upcoming_deadlines
 
@@ -656,6 +657,58 @@ def test_get_risk_items_places_schedule_docs_after_due_items() -> None:
     risks = get_risk_items(session)
     titles = [item.title for item in risks if item.title in {"TP C", "Programa analítico Cálculo I.pdf"}]
     assert titles == ["TP C", "Programa analítico Cálculo I.pdf"]
+
+
+def test_get_risk_items_includes_upcoming_exam_dates_from_schedule_facts() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    schedule_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="schedule-exam-doc",
+        object_type="resource",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/schedule-exam.pdf",
+        current_hash="hash-exam",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(schedule_source)
+    session.flush()
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=schedule_source.id,
+        course_id=course.id,
+        item_type="material_file",
+        title="Fechas de evaluación.pdf",
+        body_text="07/04 PARCIAL 1",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=schedule_source.source_url,
+        raw_payload={},
+    )
+    replace_item_facts(
+        session,
+        item=item,
+        facts=[
+            ExtractedFact(
+                fact_type="exam_at",
+                value={"value": (datetime.now(UTC) + timedelta(days=3)).isoformat(), "matched_text": "07/04 PARCIAL 1"},
+                confidence=0.7,
+                extractor_type="deterministic_text_dates",
+                source_span="07/04 PARCIAL 1",
+            )
+        ],
+        source_artifact_id=None,
+    )
+    session.commit()
+
+    risks = get_risk_items(session)
+
+    assert "Fechas de evaluación.pdf" in [entry.title for entry in risks]
 
 
 def test_get_upcoming_deadlines_excludes_completed_items() -> None:
