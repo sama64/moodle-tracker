@@ -89,6 +89,7 @@ def get_risk_items(session: Session, days: int = 14) -> list[NormalizedItem]:
     end = now + timedelta(days=days)
     items = session.scalars(
         select(NormalizedItem)
+        .options(selectinload(NormalizedItem.facts))
         .order_by(NormalizedItem.updated_at.desc())
     ).all()
     completed_keys = _completed_identity_keys(items)
@@ -235,6 +236,8 @@ def _is_risk_item(item: NormalizedItem, *, now: datetime, end: datetime) -> bool
     due_at = _normalize_datetime(item.due_at)
     if due_at is not None and now <= due_at <= end:
         return True
+    if _next_fact_datetime(item, "exam_at", now=now, end=end) is not None:
+        return True
     if item.review_status == "watch" and item.review_reason == "high_risk_schedule_document":
         return True
     if item.review_status == "needs_review" and item.review_reason == "text_extraction_failed":
@@ -242,25 +245,29 @@ def _is_risk_item(item: NormalizedItem, *, now: datetime, end: datetime) -> bool
     return False
 
 
-def _risk_rank(item: NormalizedItem) -> tuple[int, int, datetime]:
+def _risk_rank(item: NormalizedItem) -> tuple[int, int, int, datetime]:
     due_at = _normalize_datetime(item.due_at)
-    starts_at = _normalize_datetime(item.starts_at)
-    due_priority = 0 if due_at is not None else 1
-    watch_priority = 0 if item.review_status == "watch" else 1
+    exam_at = _next_fact_datetime(item, "exam_at")
+    due_priority = 2 if due_at is not None else 0
+    exam_priority = 1 if exam_at is not None else 0
+    watch_priority = 1 if item.review_status == "watch" else 0
     updated_at = _normalize_datetime(item.updated_at) or datetime.now(UTC)
-    return due_priority, watch_priority, updated_at
+    return due_priority, exam_priority, watch_priority, updated_at
 
 
 def _risk_sort_key(item: NormalizedItem) -> tuple[int, datetime]:
     due_at = _normalize_datetime(item.due_at)
+    exam_at = _next_fact_datetime(item, "exam_at")
     starts_at = _normalize_datetime(item.starts_at)
     if due_at is not None:
         return 0, due_at
+    if exam_at is not None:
+        return 1, exam_at
     if starts_at is not None:
-        return 1, starts_at
+        return 2, starts_at
     if item.review_status == "watch":
-        return 2, _normalize_datetime(item.updated_at) or datetime.now(UTC)
-    return 3, _normalize_datetime(item.updated_at) or datetime.now(UTC)
+        return 3, _normalize_datetime(item.updated_at) or datetime.now(UTC)
+    return 4, _normalize_datetime(item.updated_at) or datetime.now(UTC)
 
 
 def _risk_title(item: NormalizedItem) -> str:
@@ -549,3 +556,31 @@ def _body_digest(value: str) -> str:
     if not normalized:
         return ""
     return sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _next_fact_datetime(
+    item: NormalizedItem,
+    fact_type: str,
+    *,
+    now: datetime | None = None,
+    end: datetime | None = None,
+) -> datetime | None:
+    candidates: list[datetime] = []
+    for fact in item.facts:
+        if fact.fact_type != fact_type:
+            continue
+        raw_value = fact.value_json.get("value")
+        if not raw_value:
+            continue
+        try:
+            parsed = _normalize_datetime(datetime.fromisoformat(raw_value))
+        except (TypeError, ValueError):
+            continue
+        if parsed is None:
+            continue
+        if now is not None and parsed < now:
+            continue
+        if end is not None and parsed > end:
+            continue
+        candidates.append(parsed)
+    return min(candidates) if candidates else None
