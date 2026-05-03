@@ -12,6 +12,7 @@ services:
   api:
     build: .
     restart: unless-stopped
+    mem_limit: 384m
     env_file:
       - .env
     environment:
@@ -30,10 +31,15 @@ services:
   worker:
     build: .
     restart: unless-stopped
+    mem_limit: 512m
     env_file:
       - .env
     environment:
       PYTHONPATH: /app/src
+      FILE_DOWNLOAD_LIMIT_PER_RUN: "1"
+      MAX_FILE_EXTRACT_BYTES: "5000000"
+      PDF_EXTRACTION_TIMEOUT_SECONDS: "15"
+      PDF_EXTRACTION_MEMORY_LIMIT_MB: "192"
     volumes:
       - ./data/uni-tracker:/app/data/uni-tracker
       - ./data/uni-tracker/artifacts/runtime:/app/artifacts/runtime

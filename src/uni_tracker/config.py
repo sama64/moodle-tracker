@@ -21,9 +21,21 @@ class Settings(BaseSettings):
         alias="DATABASE_URL",
     )
     raw_storage_path: Path = Field(default=Path("data/uni-tracker/artifacts/runtime"), alias="RAW_STORAGE_PATH")
+    artifact_storage_backend: str = Field(default="local", alias="ARTIFACT_STORAGE_BACKEND")
+    s3_endpoint_url: str | None = Field(default=None, alias="S3_ENDPOINT_URL")
+    s3_bucket: str | None = Field(default=None, alias="S3_BUCKET")
+    s3_region: str = Field(default="auto", alias="S3_REGION")
+    s3_access_key_id: str | None = Field(default=None, alias="S3_ACCESS_KEY_ID")
+    s3_secret_access_key: str | None = Field(default=None, alias="S3_SECRET_ACCESS_KEY")
+    s3_key_prefix: str = Field(default="", alias="S3_KEY_PREFIX")
+    s3_presign_ttl_seconds: int = Field(default=3600, alias="S3_PRESIGN_TTL_SECONDS")
+    local_artifact_cache_path: Path = Field(default=Path("data/uni-tracker/artifacts/cache"), alias="LOCAL_ARTIFACT_CACHE_PATH")
     sync_courses_interval_minutes: int = Field(default=30, alias="SYNC_COURSES_INTERVAL_MINUTES")
     sync_contents_interval_minutes: int = Field(default=60, alias="SYNC_CONTENTS_INTERVAL_MINUTES")
     file_download_limit_per_run: int = Field(default=5, alias="FILE_DOWNLOAD_LIMIT_PER_RUN")
+    max_file_extract_bytes: int = Field(default=3_000_000, alias="MAX_FILE_EXTRACT_BYTES")
+    pdf_extraction_timeout_seconds: float = Field(default=20.0, alias="PDF_EXTRACTION_TIMEOUT_SECONDS")
+    pdf_extraction_memory_limit_mb: int = Field(default=256, alias="PDF_EXTRACTION_MEMORY_LIMIT_MB")
     daily_digest_hour: int = Field(default=7, alias="DAILY_DIGEST_HOUR")
     stale_sync_threshold_hours: int = Field(default=6, alias="STALE_SYNC_THRESHOLD_HOURS")
 
@@ -56,6 +68,7 @@ def get_settings() -> Settings:
     settings = Settings()
     try:
         settings.raw_storage_path.mkdir(parents=True, exist_ok=True)
+        settings.local_artifact_cache_path.mkdir(parents=True, exist_ok=True)
     except OSError:
         fallback = Path("data/uni-tracker/artifacts/runtime")
         fallback.mkdir(parents=True, exist_ok=True)

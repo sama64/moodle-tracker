@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from uni_tracker.models import ItemFact, ItemVersion, NormalizedItem, RawArtifact, SourceObject
+from uni_tracker.services.storage import parse_s3_storage_path
 from uni_tracker.services.moodle import stable_hash
 from uni_tracker.services.parsing import ExtractedFact
 
@@ -82,13 +83,24 @@ def create_raw_artifact(
     source_url: str | None,
     metadata_json: dict[str, Any] | None = None,
     extraction_status: str = "not_applicable",
+    storage_backend: str = "local",
+    storage_bucket: str | None = None,
+    storage_key: str | None = None,
 ) -> RawArtifact:
+    if storage_backend == "local" and storage_path.startswith("s3://"):
+        storage_backend = "s3"
+        parsed_bucket, parsed_key = parse_s3_storage_path(storage_path)
+        storage_bucket = storage_bucket or parsed_bucket
+        storage_key = storage_key or parsed_key
     artifact = RawArtifact(
         collector_run_id=collector_run_id,
         source_object_id=source_object_id,
         artifact_type=artifact_type,
         mime_type=mime_type,
         storage_path=storage_path,
+        storage_backend=storage_backend,
+        storage_bucket=storage_bucket,
+        storage_key=storage_key,
         content_hash=content_hash,
         size_bytes=size_bytes,
         extraction_status=extraction_status,

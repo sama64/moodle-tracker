@@ -16,6 +16,14 @@ from uni_tracker.models import Course, SourceAccount, SourceObject
 from uni_tracker.services.persistence import create_raw_artifact, upsert_normalized_item
 
 
+class _FakeArtifactStore:
+    def __init__(self, texts: dict[str, str]) -> None:
+        self.texts = texts
+
+    def read_text(self, storage_path: str, *, backend: str | None = None, bucket: str | None = None, key: str | None = None) -> str | None:
+        return self.texts.get(storage_path) or (self.texts.get(f"s3://{bucket}/{key}") if bucket and key else None)
+
+
 def test_collectors_endpoint() -> None:
     client = TestClient(app)
     response = client.get("/sync/collectors")
@@ -263,6 +271,93 @@ def test_item_content_exposes_downloaded_artifact_text(monkeypatch, tmp_path: Pa
     assert payload["artifacts"][0]["item_type"] == "material_file"
     assert payload["artifacts"][0]["downloaded"] is True
     assert payload["artifacts"][0]["extracted_text"] == "Semana 1\nSemana 2"
+    assert payload["artifacts"][0]["extraction_status"] == "completed"
+
+
+def test_item_content_reads_extracted_text_from_s3_artifact(monkeypatch) -> None:
+    session = _make_session()
+    _, course, source_object = _seed_resource(session)
+    resource_item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="material",
+        title="Cronograma de clases",
+        body_text=None,
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload=source_object.raw_payload,
+    )
+    session.flush()
+
+    child_source_object = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="module-1:/:Cronograma CALCULO I 1er. Cuat. 2026.pdf",
+        object_type="module_file",
+        parent_external_id=source_object.external_id,
+        source_url="https://example.invalid/pluginfile.php/1/cronograma.pdf",
+        current_hash="child-hash",
+        raw_payload={
+            "filename": "Cronograma CALCULO I 1er. Cuat. 2026.pdf",
+            "content": {
+                "filename": "Cronograma CALCULO I 1er. Cuat. 2026.pdf",
+                "filepath": "/",
+                "fileurl": "https://example.invalid/pluginfile.php/1/cronograma.pdf",
+                "mimetype": "application/pdf",
+                "filesize": 74784,
+            },
+        },
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(child_source_object)
+    session.flush()
+    child_item, _ = upsert_normalized_item(
+        session,
+        source_object_id=child_source_object.id,
+        course_id=course.id,
+        item_type="material_file",
+        title="Cronograma CALCULO I 1er. Cuat. 2026.pdf",
+        body_text="Cronograma semana 1",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload=child_source_object.raw_payload,
+    )
+    create_raw_artifact(
+        session,
+        collector_run_id=_seed_collector_run(session, source_object.source_account_id),
+        source_object_id=child_source_object.id,
+        artifact_type="extracted_text",
+        mime_type="text/plain",
+        storage_path="s3://moodle-tracker-artifacts/production/moodle/files/module-1/cronograma-text.txt",
+        content_hash="text-hash",
+        size_bytes=len(b"Semana R2"),
+        source_url=child_source_object.source_url,
+        metadata_json={"filename": child_item.title},
+        extraction_status="completed",
+        storage_backend="s3",
+        storage_bucket="moodle-tracker-artifacts",
+        storage_key="production/moodle/files/module-1/cronograma-text.txt",
+    )
+    session.commit()
+
+    _install_test_session(monkeypatch, session)
+    monkeypatch.setattr(
+        "uni_tracker.services.tools.build_artifact_store",
+        lambda settings: _FakeArtifactStore({"s3://moodle-tracker-artifacts/production/moodle/files/module-1/cronograma-text.txt": "Semana R2"}),
+    )
+    client = TestClient(app)
+    response = client.get(f"/items/{resource_item.id}/content")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["artifacts"][0]["filename"] == child_item.title
+    assert payload["artifacts"][0]["extracted_text"] == "Semana R2"
     assert payload["artifacts"][0]["extraction_status"] == "completed"
 
 

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import html
 import re
+import resource
+import subprocess
+import sys
 import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -9,8 +12,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
-
-from pypdf import PdfReader
 
 
 HTML_RE = re.compile(r"<[^>]+>")
@@ -64,6 +65,10 @@ def normalize_text(value: str | None) -> str:
     return WS_RE.sub(" ", value.replace("\x00", " ")).strip()
 
 
+DEFAULT_PDF_EXTRACTION_TIMEOUT_SECONDS = 20.0
+DEFAULT_PDF_EXTRACTION_MEMORY_LIMIT_MB = 256
+
+
 def _coerce_year(year: str | None, reference_year: int) -> int:
     if year is None:
         return reference_year
@@ -73,12 +78,46 @@ def _coerce_year(year: str | None, reference_year: int) -> int:
     return parsed
 
 
-def extract_text_from_pdf(content: bytes) -> str:
-    reader = PdfReader(BytesIO(content))
-    chunks = []
-    for page in reader.pages:
-        chunks.append(page.extract_text() or "")
-    return normalize_text("\n".join(chunks))
+def extract_text_from_pdf(
+    content: bytes,
+    *,
+    timeout_seconds: float = DEFAULT_PDF_EXTRACTION_TIMEOUT_SECONDS,
+    memory_limit_mb: int = DEFAULT_PDF_EXTRACTION_MEMORY_LIMIT_MB,
+) -> str:
+    code = r"""
+import re
+import sys
+from io import BytesIO
+from pypdf import PdfReader
+content = sys.stdin.buffer.read()
+reader = PdfReader(BytesIO(content))
+chunks = []
+for page in reader.pages:
+    chunks.append(page.extract_text() or "")
+text = "\n".join(chunks).replace("\x00", " ")
+sys.stdout.write(re.sub(r"\s+", " ", text).strip())
+""".strip()
+
+    def limit_memory() -> None:
+        if memory_limit_mb > 0:
+            memory_limit_bytes = memory_limit_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            input=content,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+            preexec_fn=limit_memory if memory_limit_mb > 0 else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"PDF extraction exceeded {timeout_seconds}s") from exc
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace") or f"PDF extractor exited {result.returncode}")
+    return normalize_text(result.stdout.decode("utf-8", errors="replace"))
 
 
 def extract_text_from_docx(content: bytes) -> str:
@@ -93,11 +132,22 @@ def extract_text_from_html(content: bytes) -> str:
     return strip_html(content.decode("utf-8", errors="replace")) or ""
 
 
-def extract_text_for_file(filename: str, mime_type: str, content: bytes) -> tuple[str | None, str]:
+def extract_text_for_file(
+    filename: str,
+    mime_type: str,
+    content: bytes,
+    *,
+    pdf_timeout_seconds: float = DEFAULT_PDF_EXTRACTION_TIMEOUT_SECONDS,
+    pdf_memory_limit_mb: int = DEFAULT_PDF_EXTRACTION_MEMORY_LIMIT_MB,
+) -> tuple[str | None, str]:
     lower = filename.lower()
     try:
         if mime_type == "application/pdf" or lower.endswith(".pdf"):
-            return extract_text_from_pdf(content), "pdf"
+            return extract_text_from_pdf(
+                content,
+                timeout_seconds=pdf_timeout_seconds,
+                memory_limit_mb=pdf_memory_limit_mb,
+            ), "pdf"
         if (
             mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             or lower.endswith(".docx")
@@ -105,6 +155,8 @@ def extract_text_for_file(filename: str, mime_type: str, content: bytes) -> tupl
             return extract_text_from_docx(content), "docx"
         if mime_type in {"text/html", "text/plain"} or lower.endswith((".html", ".htm", ".txt")):
             return extract_text_from_html(content), "html_or_text"
+    except TimeoutError:
+        return None, "failed_timeout"
     except Exception:
         return None, "failed"
     return None, "unsupported"
