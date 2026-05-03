@@ -790,7 +790,11 @@ class MoodleFilesCollector(BaseCollector):
 
         downloaded = 0
         extracted = 0
-        for module, content in batch:
+        skipped_extraction = 0
+        max_extract_bytes = getattr(self.context.settings, "max_file_extract_bytes", 3_000_000)
+        pdf_timeout_seconds = getattr(self.context.settings, "pdf_extraction_timeout_seconds", 20.0)
+        pdf_memory_limit_mb = getattr(self.context.settings, "pdf_extraction_memory_limit_mb", 256)
+        for batch_offset, (module, content) in enumerate(batch):
             url = content.get("fileurl")
             filename = content.get("filename") or "file"
             bytes_content = client.download_file(url)
@@ -829,8 +833,21 @@ class MoodleFilesCollector(BaseCollector):
                 source_url=url,
                 metadata_json={"collector": self.name, "filename": filename},
             )
-            text, extraction_mode = extract_text_for_file(filename, content.get("mimetype") or "", bytes_content)
-            review_status, review_reason = derive_review_status(filename, text)
+            declared_size = int(content.get("filesize") or 0)
+            extract_size = max(declared_size, len(bytes_content))
+            if max_extract_bytes > 0 and extract_size > max_extract_bytes:
+                text, extraction_mode = None, "skipped_too_large"
+                review_status, review_reason = "needs_review", "extraction_skipped_too_large"
+                skipped_extraction += 1
+            else:
+                text, extraction_mode = extract_text_for_file(
+                    filename,
+                    content.get("mimetype") or "",
+                    bytes_content,
+                    pdf_timeout_seconds=pdf_timeout_seconds,
+                    pdf_memory_limit_mb=pdf_memory_limit_mb,
+                )
+                review_status, review_reason = derive_review_status(filename, text)
             facts: list[ExtractedFact] = []
             if text:
                 text_path, text_hash, text_size = self.context.artifact_store.write_text(
@@ -891,6 +908,11 @@ class MoodleFilesCollector(BaseCollector):
             if state.state in {"created", "updated"}:
                 schedule_notifications_for_item(self.context.session, item, state)
             downloaded += 1
+            progress_index = (start_index + batch_offset + 1) % total_candidates if total_candidates else 0
+            metadata["moodle_files_cursor"] = progress_index
+            self.context.source_account.metadata_json = metadata
+            run.checkpoint = {"start_index": start_index, "next_index": progress_index, "total_candidates": total_candidates}
+            self.context.session.commit()
         client.close()
         metadata["moodle_files_cursor"] = next_index
         self.context.source_account.metadata_json = metadata
@@ -898,6 +920,7 @@ class MoodleFilesCollector(BaseCollector):
         return {
             "files_downloaded": downloaded,
             "files_with_text": extracted,
+            "files_skipped_extraction": skipped_extraction,
             "total_candidates": total_candidates,
             "next_index": next_index,
         }

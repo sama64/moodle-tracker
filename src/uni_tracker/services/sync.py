@@ -16,7 +16,7 @@ from uni_tracker.collectors.moodle import (
 from uni_tracker.config import get_settings
 from uni_tracker.db import SessionLocal
 from uni_tracker.models import SourceAccount
-from uni_tracker.services.storage import ArtifactStore
+from uni_tracker.services.storage import build_artifact_store
 
 
 COLLECTOR_REGISTRY = {
@@ -63,7 +63,7 @@ def run_collector(collector_name: str) -> dict:
         context = CollectorContext(
             session=session,
             settings=settings,
-            artifact_store=ArtifactStore(settings.raw_storage_path),
+            artifact_store=build_artifact_store(settings),
             source_account=account,
         )
         collector = collector_cls(context)

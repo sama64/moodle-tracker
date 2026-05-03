@@ -1585,7 +1585,19 @@ def test_get_changes_since_can_mark_refresh_only_changes() -> None:
     session.commit()
 
     since = datetime.now(UTC) - timedelta(hours=1)
-    item.updated_at = datetime.now(UTC) - timedelta(minutes=5)
+    upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="calendar_event",
+        title="Quiz 1 closes",
+        body_text="Same event",
+        published_at=None,
+        starts_at=item.starts_at,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload={"version": 2},
+    )
     session.commit()
 
     changes = get_changes_since(session, since, include_meaningful_meta=True)
@@ -1618,8 +1630,19 @@ def test_get_changes_since_can_mark_deadline_changed() -> None:
     session.commit()
 
     since = datetime.now(UTC) - timedelta(hours=1)
-    item.due_at = original_due_at + timedelta(days=1)
-    item.updated_at = datetime.now(UTC) - timedelta(minutes=5)
+    upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP 3",
+        body_text="Entrega",
+        published_at=None,
+        starts_at=None,
+        due_at=original_due_at + timedelta(days=1),
+        primary_url=source_object.source_url,
+        raw_payload={"version": 2},
+    )
     session.commit()
 
     changes = get_changes_since(session, since, include_meaningful_meta=True)
@@ -1688,6 +1711,208 @@ def test_get_changes_since_matches_calendar_refreshes_by_semantic_identity() -> 
     assert len(changes) == 1
     assert changes[0]["meaningful_change"] is False
     assert changes[0]["change_kind"] == "refresh_only"
+
+
+def test_get_changes_since_deduplicates_same_identity_to_latest_richest_item() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    baseline, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="Entrega TP Nº 3",
+        body_text="",
+        published_at=None,
+        starts_at=datetime.now(UTC) + timedelta(days=1),
+        due_at=None,
+        primary_url="https://example.invalid/assign/3",
+        raw_payload={"version": 0},
+    )
+    session.flush()
+    baseline.updated_at = datetime.now(UTC) - timedelta(hours=2)
+    session.commit()
+
+    since = datetime.now(UTC) - timedelta(hours=1)
+
+    shadow_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="assign-shadow",
+        object_type="assign",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/assign/3",
+        current_hash="hash-assign-shadow",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(shadow_source)
+    session.flush()
+    shadow, _ = upsert_normalized_item(
+        session,
+        source_object_id=shadow_source.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="Entrega TP Nº 3",
+        body_text="",
+        published_at=None,
+        starts_at=baseline.starts_at,
+        due_at=None,
+        primary_url="https://example.invalid/assign/3",
+        raw_payload={"version": 1},
+    )
+    session.flush()
+    shadow.updated_at = datetime.now(UTC) - timedelta(minutes=10)
+
+    richer_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="assign-richer",
+        object_type="assign",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/assign/3",
+        current_hash="hash-assign-richer",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(richer_source)
+    session.flush()
+    richer, _ = upsert_normalized_item(
+        session,
+        source_object_id=richer_source.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="Entrega TP Nº 3",
+        body_text="",
+        published_at=datetime.now(UTC),
+        starts_at=baseline.starts_at,
+        due_at=datetime.now(UTC) + timedelta(days=7),
+        primary_url="https://example.invalid/assign/3",
+        raw_payload={"version": 2},
+    )
+    session.flush()
+    richer.updated_at = datetime.now(UTC) - timedelta(minutes=5)
+    session.commit()
+
+    changes = get_changes_since(session, since, include_meaningful_meta=True)
+
+    assert len(changes) == 1
+    assert changes[0]["item"].id == richer.id
+    assert changes[0]["item"].due_at is not None
+    assert shadow.id != richer.id
+
+
+def test_get_risk_items_excludes_generic_text_extraction_failures() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    extraction_failed_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="failed-pptx",
+        object_type="resource",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/slides.pptx",
+        current_hash="hash-failed-pptx",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(extraction_failed_source)
+    session.flush()
+    upsert_normalized_item(
+        session,
+        source_object_id=extraction_failed_source.id,
+        course_id=course.id,
+        item_type="material_file",
+        title="Clase 1.pptx",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=extraction_failed_source.source_url,
+        raw_payload={},
+        review_status="needs_review",
+        review_reason="text_extraction_failed",
+    )
+
+    due_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="due-cleanup-test",
+        object_type="assign",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/due-cleanup-test",
+        current_hash="hash-due-cleanup-test",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(due_source)
+    session.flush()
+    upsert_normalized_item(
+        session,
+        source_object_id=due_source.id,
+        course_id=course.id,
+        item_type="assignment",
+        title="TP urgente",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=datetime.now(UTC) + timedelta(days=1),
+        primary_url=due_source.source_url,
+        raw_payload={},
+    )
+    session.commit()
+
+    risks = get_risk_items(session)
+    titles = [item.title for item in risks]
+
+    assert "TP urgente" in titles
+    assert "Clase 1.pptx" not in titles
+
+
+def test_get_risk_items_includes_schedule_docs_even_if_latest_extraction_failed() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    schedule_source = SourceObject(
+        source_account_id=source_object.source_account_id,
+        course_id=course.id,
+        external_id="schedule-docx",
+        object_type="resource",
+        parent_external_id=course.external_id,
+        source_url="https://example.invalid/cronograma.docx",
+        current_hash="hash-schedule-docx",
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(schedule_source)
+    session.flush()
+    upsert_normalized_item(
+        session,
+        source_object_id=schedule_source.id,
+        course_id=course.id,
+        item_type="material_file",
+        title="Cronograma de Ciencia de los Materiales. 1C-2026.docx",
+        body_text="",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=schedule_source.source_url,
+        raw_payload={},
+        review_status="needs_review",
+        review_reason="text_extraction_failed",
+    )
+    session.commit()
+
+    titles = [item.title for item in get_risk_items(session)]
+
+    assert "Cronograma de Ciencia de los Materiales. 1C-2026.docx" in titles
 
 
 def test_build_digest_message_orders_course_blocks_by_soonest_due() -> None:

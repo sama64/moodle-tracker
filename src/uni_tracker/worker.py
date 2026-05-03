@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -11,6 +12,41 @@ from uni_tracker.services.notifications import dispatch_due_notifications, sched
 from uni_tracker.services.telegram_bot import poll_telegram_commands
 from uni_tracker.services.sync import run_all_collectors, run_collector
 
+logger = logging.getLogger(__name__)
+
+COLLECTOR_ORDER = [
+    "moodle_courses",
+    "moodle_contents",
+    "moodle_updates",
+    "moodle_forums",
+    "moodle_assignments",
+    "moodle_grades",
+    "moodle_calendar",
+    "moodle_files",
+]
+
+
+def _run_collector_job(collector_name: str) -> dict:
+    try:
+        return run_collector(collector_name)
+    except Exception as exc:
+        logger.exception("Collector %s failed", collector_name)
+        return {"status": "failed", "error": str(exc)}
+
+
+def _post_collection_job() -> None:
+    with SessionLocal() as session:
+        schedule_daily_digest(session)
+        dispatch_due_notifications(session)
+        poll_telegram_commands(session)
+        session.commit()
+
+
+def _enrichment_job() -> None:
+    with SessionLocal() as session:
+        enrich_recent_items(session)
+        session.commit()
+
 
 def _poll_telegram_job() -> None:
     with SessionLocal() as session:
@@ -18,23 +54,19 @@ def _poll_telegram_job() -> None:
         session.commit()
 
 
-def _run_collectors_job() -> None:
-    run_collector("moodle_courses")
-    run_collector("moodle_contents")
-    run_collector("moodle_updates")
-    run_collector("moodle_forums")
-    run_collector("moodle_assignments")
-    run_collector("moodle_grades")
-    run_collector("moodle_calendar")
-    run_collector("moodle_files")
-    with SessionLocal() as session:
-        schedule_daily_digest(session)
-        dispatch_due_notifications(session)
-        poll_telegram_commands(session)
-        session.commit()
-    with SessionLocal() as session:
-        enrich_recent_items(session)
-        session.commit()
+def _run_collectors_job() -> dict[str, dict]:
+    results = {}
+    for collector_name in COLLECTOR_ORDER:
+        results[collector_name] = _run_collector_job(collector_name)
+    try:
+        _post_collection_job()
+    except Exception:
+        logger.exception("Post-collection notification job failed")
+    try:
+        _enrichment_job()
+    except Exception:
+        logger.exception("Post-collection enrichment job failed")
+    return results
 
 
 def main() -> None:
@@ -56,19 +88,19 @@ def main() -> None:
 
     settings = get_settings()
     scheduler = BlockingScheduler(timezone="America/Argentina/Buenos_Aires")
-    scheduler.add_job(run_collector, "interval", minutes=settings.sync_courses_interval_minutes, args=["moodle_courses"])
+    scheduler.add_job(_run_collector_job, "interval", minutes=settings.sync_courses_interval_minutes, args=["moodle_courses"])
     scheduler.add_job(
-        run_collector,
+        _run_collector_job,
         "interval",
         minutes=settings.sync_contents_interval_minutes,
         args=["moodle_contents"],
     )
-    scheduler.add_job(run_collector, "interval", minutes=20, args=["moodle_updates"])
-    scheduler.add_job(run_collector, "interval", minutes=30, args=["moodle_forums"])
-    scheduler.add_job(run_collector, "interval", minutes=60, args=["moodle_assignments"])
-    scheduler.add_job(run_collector, "interval", minutes=180, args=["moodle_grades"])
-    scheduler.add_job(run_collector, "interval", minutes=60, args=["moodle_calendar"])
-    scheduler.add_job(run_collector, "interval", minutes=90, args=["moodle_files"])
+    scheduler.add_job(_run_collector_job, "interval", minutes=20, args=["moodle_updates"])
+    scheduler.add_job(_run_collector_job, "interval", minutes=30, args=["moodle_forums"])
+    scheduler.add_job(_run_collector_job, "interval", minutes=60, args=["moodle_assignments"])
+    scheduler.add_job(_run_collector_job, "interval", minutes=180, args=["moodle_grades"])
+    scheduler.add_job(_run_collector_job, "interval", minutes=60, args=["moodle_calendar"])
+    scheduler.add_job(_run_collector_job, "interval", minutes=90, args=["moodle_files"])
     scheduler.add_job(
         _poll_telegram_job,
         "interval",

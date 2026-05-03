@@ -173,6 +173,7 @@ python -m compileall -q src scripts
 
 - Moodle is the primary source of truth.
 - Raw source artifacts are retained under `data/uni-tracker/artifacts/runtime/` for provenance and replay.
+- To store artifacts in Cloudflare R2 instead of the VPS filesystem, set `ARTIFACT_STORAGE_BACKEND=s3` plus the `S3_*` variables from `.env.example`, run `alembic upgrade head`, and migrate existing local artifacts with `scripts/migrate_artifacts_to_r2.py` after a dry run and verification.
 - Postgres persists in the named Docker volume `uni_tracker_postgres_data`.
 - Human-facing alerts stay conservative and source-linked.
 - Agent-facing consumers should prefer briefs and provenance over raw Moodle pages whenever possible.

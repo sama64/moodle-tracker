@@ -10,8 +10,9 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Session
 
 from uni_tracker.config import get_settings
-from uni_tracker.models import Course, ItemFact, NormalizedItem, Notification, RawArtifact, SourceObject
+from uni_tracker.models import Course, ItemFact, ItemVersion, NormalizedItem, Notification, RawArtifact, SourceObject
 from uni_tracker.services.completion import is_completed
+from uni_tracker.services.storage import build_artifact_store
 
 ACTIONABLE_COMPLETION_ITEM_TYPES = {"assignment", "quiz"}
 
@@ -38,7 +39,9 @@ def get_changes_since(
     if not include_meaningful_meta:
         return items
 
+    items = _dedupe_changes_since_items(items)
     candidate_keys = [get_semantic_identity_key(item) for item in items]
+    latest_versions_by_item = _latest_versions_by_item(session, normalized_since, [item.id for item in items])
     historical_items = session.scalars(
         select(NormalizedItem)
         .where(NormalizedItem.updated_at < normalized_since)
@@ -52,9 +55,22 @@ def get_changes_since(
 
     payloads: list[dict] = []
     for item in items:
+        version = latest_versions_by_item.get(item.id)
+        meaningful_key = get_meaningful_change_key(item)
+        if version is not None:
+            previous_key = _meaningful_change_key_from_version_previous(item, version)
+            payloads.append(
+                {
+                    "item": item,
+                    "meaningful_key": meaningful_key,
+                    "meaningful_change": previous_key != meaningful_key,
+                    "change_kind": _change_type_from_version(version, previous_key != meaningful_key),
+                }
+            )
+            continue
+
         identity_key = get_semantic_identity_key(item)
         previous = previous_by_identity.get(identity_key)
-        meaningful_key = get_meaningful_change_key(item)
         previous_key = get_meaningful_change_key(previous) if previous is not None else None
         payloads.append(
             {
@@ -230,6 +246,105 @@ def get_change_kind(item: NormalizedItem, previous: NormalizedItem | None) -> st
     return "refresh_only"
 
 
+def _dedupe_changes_since_items(items: list[NormalizedItem]) -> list[NormalizedItem]:
+    grouped: dict[str, NormalizedItem] = {}
+    for item in items:
+        identity_key = get_semantic_identity_key(item)
+        if identity_key is None:
+            continue
+        current = grouped.get(identity_key)
+        if current is None or _change_window_rank(item) > _change_window_rank(current):
+            grouped[identity_key] = item
+    return sorted(grouped.values(), key=lambda item: (_normalize_datetime(item.updated_at) or datetime.min.replace(tzinfo=UTC), item.id))
+
+
+def _latest_versions_by_item(session: Session, since: datetime, item_ids: list[int]) -> dict[int, ItemVersion]:
+    if not item_ids:
+        return {}
+    versions = session.scalars(
+        select(ItemVersion)
+        .where(ItemVersion.normalized_item_id.in_(item_ids), ItemVersion.changed_at >= since)
+        .order_by(ItemVersion.changed_at.desc(), ItemVersion.id.desc())
+    ).all()
+    latest: dict[int, ItemVersion] = {}
+    for version in versions:
+        if version.normalized_item_id not in latest:
+            latest[version.normalized_item_id] = version
+    return latest
+
+
+def _change_window_rank(item: NormalizedItem) -> tuple[int, int, int, datetime, int]:
+    return (
+        1 if item.due_at is not None else 0,
+        1 if item.starts_at is not None else 0,
+        1 if item.published_at is not None else 0,
+        _normalize_datetime(item.updated_at) or datetime.min.replace(tzinfo=UTC),
+        item.id,
+    )
+
+
+def _meaningful_change_key_from_version_previous(item: NormalizedItem, version: ItemVersion) -> str | None:
+    previous_values = version.previous_values or {}
+    title = previous_values.get("title", item.title)
+    body_text = previous_values.get("body_text", item.body_text)
+    due_at = _coerce_version_datetime(previous_values.get("due_at", item.due_at))
+    starts_at = _coerce_version_datetime(previous_values.get("starts_at", item.starts_at))
+    primary_url = previous_values.get("primary_url", item.primary_url)
+    review_status = previous_values.get("review_status", item.review_status)
+    review_reason = previous_values.get("review_reason", item.review_reason)
+    payload = "|".join(
+        [
+            str(item.course_id or ""),
+            item.item_type,
+            _stable_title(title),
+            _datetime_key(due_at),
+            _datetime_key(starts_at),
+            review_status or "",
+            review_reason or "",
+            primary_url or "",
+            _body_digest((body_text or "").strip()),
+        ]
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _coerce_version_datetime(value: datetime | str | None) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return _normalize_datetime(value)
+    if isinstance(value, str):
+        return _normalize_datetime(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    return None
+
+
+def _change_type_from_version(version: ItemVersion, meaningful_change: bool) -> str:
+    changed_fields = set(version.changed_fields or [])
+    previous_values = version.previous_values or {}
+    new_values = version.new_values or {}
+    if "due_at" in changed_fields:
+        if previous_values.get("due_at") and new_values.get("due_at"):
+            return "deadline_changed"
+        if previous_values.get("due_at") and not new_values.get("due_at"):
+            return "deadline_removed"
+        if not previous_values.get("due_at") and new_values.get("due_at"):
+            return "deadline_added"
+    if "starts_at" in changed_fields:
+        return "schedule_changed"
+    if "facts_payload" in changed_fields:
+        previous_facts = {fact.get("fact_type") for fact in previous_values.get("facts_payload") or []}
+        new_facts = {fact.get("fact_type") for fact in new_values.get("facts_payload") or []}
+        if {"class_session_at", "starts_at"} & (previous_facts | new_facts):
+            return "schedule_changed"
+        if {"due_at"} & (previous_facts | new_facts):
+            return "deadline_changed"
+        if {"exam_at"} & (previous_facts | new_facts):
+            return "exam_changed"
+    if not meaningful_change:
+        return "refresh_only"
+    return "content_changed"
+
+
 def _is_risk_item(item: NormalizedItem, *, now: datetime, end: datetime) -> bool:
     if item.status != "active":
         return False
@@ -240,9 +355,16 @@ def _is_risk_item(item: NormalizedItem, *, now: datetime, end: datetime) -> bool
         return True
     if item.review_status == "watch" and item.review_reason == "high_risk_schedule_document":
         return True
-    if item.review_status == "needs_review" and item.review_reason == "text_extraction_failed":
-        return item.item_type in {"material_file", "resource"}
+    if _looks_like_schedule_document(item):
+        return True
     return False
+
+
+def _looks_like_schedule_document(item: NormalizedItem) -> bool:
+    if item.item_type not in {"material", "material_file"}:
+        return False
+    title = _stable_text(item.title)
+    return any(keyword in title for keyword in ("cronograma", "calendario", "horario", "fechas"))
 
 
 def _risk_rank(item: NormalizedItem) -> tuple[int, int, int, datetime]:
@@ -433,7 +555,7 @@ def _merge_downloaded_artifacts(
     for artifact in reversed(artifacts):
         if artifact.artifact_type != "extracted_text":
             continue
-        candidate_text = _read_artifact_text(artifact.storage_path)
+        candidate_text = _read_artifact_text(artifact)
         if candidate_text is None:
             if extracted_text_artifact is None:
                 extracted_text_artifact = artifact
@@ -514,16 +636,14 @@ def _coerce_int(value: object) -> int | None:
         return None
 
 
-def _read_artifact_text(storage_path: str) -> str | None:
-    artifact_root = get_settings().raw_storage_path
-    artifact_path = (artifact_root / storage_path).resolve()
-    try:
-        artifact_path.relative_to(artifact_root.resolve())
-    except ValueError:
-        return None
-    if not artifact_path.is_file():
-        return None
-    return artifact_path.read_text(encoding="utf-8", errors="replace")
+def _read_artifact_text(artifact: RawArtifact) -> str | None:
+    store = build_artifact_store(get_settings())
+    return store.read_text(
+        artifact.storage_path,
+        backend=getattr(artifact, "storage_backend", "local"),
+        bucket=getattr(artifact, "storage_bucket", None),
+        key=getattr(artifact, "storage_key", None),
+    )
 
 
 def _datetime_key(value: datetime | None) -> str:
