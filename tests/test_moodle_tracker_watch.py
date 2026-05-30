@@ -523,3 +523,30 @@ def test_main_alerts_on_upcoming_parcial_inside_schedule_doc(tmp_path, capsys, m
     assert payload["send_update"] is True
     assert payload["urgent_schedule_count"] == 1
     assert any("PARCIAL 2" in line and "28/04" in line for line in payload["lines"])
+
+
+def test_exam_reminder_policy_starts_at_three_days_not_seven():
+    module = load_watch_module()
+
+    now = module.datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
+    seven_days_out = {
+        "at": module.datetime(2026, 6, 2, 12, 0, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    three_days_out = {
+        "at": module.datetime(2026, 5, 29, 12, 0, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+    assert module.exam_reminder_bucket(seven_days_out, now) is None
+    assert module.exam_reminder_bucket(three_days_out, now) == "three_days_before"
+
+
+def test_date_only_exam_still_alerts_on_same_local_day():
+    module = load_watch_module()
+
+    now = module.datetime(2026, 6, 2, 18, 0, tzinfo=timezone.utc)
+    date_only_event = {
+        "at": module.datetime(2026, 6, 2, 3, 0, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "all_day": True,
+    }
+
+    assert module.exam_reminder_bucket(date_only_event, now) == "same_day"

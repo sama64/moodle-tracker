@@ -19,12 +19,19 @@ DEADLINE_REMINDER_PATH = STATE_DIR / 'moodle_tracker_deadline_reminders.json'
 SCHEDULE_REMINDER_PATH = STATE_DIR / 'moodle_tracker_schedule_reminders.json'
 TZ = ZoneInfo('America/Argentina/Buenos_Aires')
 URGENT_DEADLINE_WINDOW_HOURS = 24
-# Exams/schedule dates need earlier heads-up than ordinary deadlines. The reminder
-# logic below sends escalating one-time reminders as an exam enters these windows.
+# Exams/schedule dates need earlier heads-up than ordinary deadlines, but not a
+# full week of noise. Keep this tight: 3 days, day-before, and same-day.
 EXAM_REMINDER_BUCKETS_HOURS = (
-    ('week_before', 7 * 24),
     ('three_days_before', 72),
     ('day_before', 24),
+)
+# Schedule documents often only give a date, not a time. Those must be handled
+# as all-day academic risks; otherwise a date-only exam becomes "past" at
+# 00:00 and we never send the same-day heads-up Santiago actually needs.
+EXAM_REMINDER_BUCKETS_DAYS = (
+    ('three_days_before', 3),
+    ('day_before', 1),
+    ('same_day', 0),
 )
 URGENT_SCHEDULE_WINDOW_HOURS = max(hours for _, hours in EXAM_REMINDER_BUCKETS_HOURS)
 ACTIONABLE_DEADLINE_WINDOW_DAYS = 14
@@ -125,6 +132,16 @@ def fmt_local(value: str | None) -> str | None:
     return dt.astimezone(TZ).strftime('%a %d/%m %H:%M')
 
 
+def fmt_schedule_time(event: dict) -> str | None:
+    dt = parse_dt(event.get('at'))
+    if not dt:
+        return None
+    local = dt.astimezone(TZ)
+    if event.get('all_day'):
+        return local.strftime('%a %d/%m') + ' (time not specified)'
+    return local.strftime('%a %d/%m %H:%M')
+
+
 def bump_iso_cursor(value: str) -> str:
     dt = parse_dt(value)
     if dt is None:
@@ -168,10 +185,23 @@ def exam_reminder_bucket(event: dict, now_utc: datetime) -> str | None:
     at = parse_dt(event.get('at'))
     if at is None:
         return None
+    if event.get('all_day'):
+        event_date = at.astimezone(TZ).date()
+        today = now_utc.astimezone(TZ).date()
+        days_until = (event_date - today).days
+        if days_until < 0:
+            return None
+        # Return the tightest date-based window so reminders escalate from
+        # 3 days -> day before -> same day, even when Moodle gave no time.
+        for bucket, window_days in sorted(EXAM_REMINDER_BUCKETS_DAYS, key=lambda pair: pair[1]):
+            if days_until <= window_days:
+                return bucket
+        return None
+
     hours_until = (at - now_utc).total_seconds() / 3600
     if hours_until < 0:
         return None
-    # Return the smallest matching window so reminders escalate from week -> 3 days -> 1 day.
+    # Return the tightest matching window so reminders escalate from 3 days -> 1 day.
     for bucket, window_hours in sorted(EXAM_REMINDER_BUCKETS_HOURS, key=lambda pair: pair[1]):
         if hours_until <= window_hours:
             return bucket
@@ -180,9 +210,9 @@ def exam_reminder_bucket(event: dict, now_utc: datetime) -> str | None:
 
 def bucket_label(bucket: str) -> str:
     return {
-        'week_before': 'exam/schedule within 7 days',
         'three_days_before': 'exam/schedule within 3 days',
         'day_before': 'exam/schedule tomorrow/soon',
+        'same_day': 'exam/schedule today',
     }.get(bucket, 'exam/schedule soon')
 
 
@@ -261,12 +291,19 @@ def extract_schedule_events(risks: list[dict], now_utc: datetime) -> list[dict]:
                 year += 2000
             hour = int(match.group(4) or 0)
             minute = int(match.group(5) or 0)
+            all_day = match.group(4) is None
             try:
                 local_dt = datetime(year, month, day, hour, minute, tzinfo=TZ)
             except ValueError:
                 continue
             dt = local_dt.astimezone(timezone.utc)
-            if not (now_utc <= dt <= horizon_end):
+            if all_day:
+                today = now_utc.astimezone(TZ).date()
+                event_date = local_dt.date()
+                horizon_date = horizon_end.astimezone(TZ).date()
+                if not (today <= event_date <= horizon_date):
+                    continue
+            elif not (now_utc <= dt <= horizon_end):
                 continue
             label = ' '.join(context.split())[:220]
             events.append({
@@ -275,6 +312,7 @@ def extract_schedule_events(risks: list[dict], now_utc: datetime) -> list[dict]:
                 'title': item.get('title'),
                 'label': label,
                 'url': item.get('primary_url'),
+                'all_day': all_day,
             })
     deduped = {}
     for event in events:
@@ -499,7 +537,7 @@ def main() -> int:
     if urgent_schedule_events:
         for event in urgent_schedule_events:
             course = course_map.get(event.get('course_id'), f"Course {event.get('course_id')}")
-            at = fmt_local(event.get('at'))
+            at = fmt_schedule_time(event)
             label = bucket_label(str(event.get('reminder_bucket') or ''))
             bits = [f"• {course}", event.get('label') or event.get('title'), f'[{label}]']
             if at:
