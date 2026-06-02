@@ -24,15 +24,31 @@ def get_health_snapshot(session: Session) -> dict:
         select(CollectorRun).order_by(CollectorRun.started_at.desc()).limit(10)
     ).all()
     stale_cutoff = datetime.now(UTC) - timedelta(hours=settings.stale_sync_threshold_hours)
+    running_cutoff = datetime.now(UTC) - timedelta(minutes=30)
+
+    # The top N recent runs are only for display. They are not a reliable source
+    # for staleness: a busy collector can push another collector's latest run out
+    # of the first 10 rows, making health falsely report it as missing/stale.
     latest_by_collector = {}
-    for run in runs:
-        latest_by_collector.setdefault(run.collector_name, run)
+    for collector_name in COLLECTOR_REGISTRY:
+        latest = session.scalar(
+            select(CollectorRun)
+            .where(CollectorRun.collector_name == collector_name)
+            .order_by(CollectorRun.started_at.desc())
+            .limit(1)
+        )
+        if latest is not None:
+            latest_by_collector[collector_name] = latest
     seen_collectors = set(latest_by_collector)
     stale_collectors = sorted(
         {
             run.collector_name
             for run in latest_by_collector.values()
-            if run.status != "completed" or (run.finished_at and _as_utc(run.finished_at) < stale_cutoff)
+            if (
+                (run.status == "running" and _as_utc(run.started_at) < running_cutoff)
+                or (run.status != "completed" and run.status != "running")
+                or (run.finished_at and _as_utc(run.finished_at) < stale_cutoff)
+            )
         }
         | (set(COLLECTOR_REGISTRY) - seen_collectors)
     )
