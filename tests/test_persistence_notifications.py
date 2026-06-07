@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from uni_tracker.db import Base
-from uni_tracker.models import Course, ItemBrief, LLMJob, Notification, SourceAccount, SourceObject
+from uni_tracker.models import Course, ItemBrief, ItemVersion, LLMJob, Notification, SourceAccount, SourceObject
 from uni_tracker.services.notifications import (
     dispatch_due_notifications,
     build_digest_message,
@@ -1603,6 +1603,51 @@ def test_get_changes_since_can_mark_refresh_only_changes() -> None:
     changes = get_changes_since(session, since, include_meaningful_meta=True)
 
     assert len(changes) == 1
+    assert changes[0]["meaningful_change"] is False
+    assert changes[0]["change_kind"] == "refresh_only"
+
+
+def test_get_changes_since_treats_known_item_updated_without_version_as_refresh_only() -> None:
+    session = make_session()
+    _, course, source_object = seed_source_graph(session)
+
+    item, _ = upsert_normalized_item(
+        session,
+        source_object_id=source_object.id,
+        course_id=course.id,
+        item_type="material",
+        title="Bibliografía de consulta para el primer parcial",
+        body_text="Same old material",
+        published_at=None,
+        starts_at=None,
+        due_at=None,
+        primary_url=source_object.source_url,
+        raw_payload={"version": 1},
+    )
+    session.flush()
+    old_time = datetime.now(UTC) - timedelta(hours=2)
+    item.updated_at = old_time
+    session.add(
+        ItemVersion(
+            normalized_item_id=item.id,
+            source_artifact_id=None,
+            version_number=1,
+            changed_fields=[],
+            previous_values=None,
+            new_values={"title": item.title, "body_text": item.body_text},
+            changed_at=old_time,
+        )
+    )
+    session.commit()
+
+    since = datetime.now(UTC) - timedelta(hours=1)
+    item.updated_at = datetime.now(UTC) - timedelta(minutes=5)
+    session.commit()
+
+    changes = get_changes_since(session, since, include_meaningful_meta=True)
+
+    assert len(changes) == 1
+    assert changes[0]["item"].id == item.id
     assert changes[0]["meaningful_change"] is False
     assert changes[0]["change_kind"] == "refresh_only"
 

@@ -41,7 +41,9 @@ def get_changes_since(
 
     items = _dedupe_changes_since_items(items)
     candidate_keys = [get_semantic_identity_key(item) for item in items]
-    latest_versions_by_item = _latest_versions_by_item(session, normalized_since, [item.id for item in items])
+    item_ids = [item.id for item in items]
+    latest_versions_by_item = _latest_versions_by_item(session, normalized_since, item_ids)
+    historical_versions_by_item = _historical_versions_by_item(session, normalized_since, item_ids)
     historical_items = session.scalars(
         select(NormalizedItem)
         .where(NormalizedItem.updated_at < normalized_since)
@@ -65,6 +67,20 @@ def get_changes_since(
                     "meaningful_key": meaningful_key,
                     "meaningful_change": previous_key != meaningful_key,
                     "change_kind": _change_type_from_version(version, previous_key != meaningful_key),
+                }
+            )
+            continue
+
+        if item.id in historical_versions_by_item:
+            # The row was already known before this cursor, but a collector touched
+            # updated_at without creating an ItemVersion in the current window.
+            # Treat that as operational refresh, not a student-visible new item.
+            payloads.append(
+                {
+                    "item": item,
+                    "meaningful_key": meaningful_key,
+                    "meaningful_change": False,
+                    "change_kind": "refresh_only",
                 }
             )
             continue
@@ -264,6 +280,21 @@ def _latest_versions_by_item(session: Session, since: datetime, item_ids: list[i
     versions = session.scalars(
         select(ItemVersion)
         .where(ItemVersion.normalized_item_id.in_(item_ids), ItemVersion.changed_at >= since)
+        .order_by(ItemVersion.changed_at.desc(), ItemVersion.id.desc())
+    ).all()
+    latest: dict[int, ItemVersion] = {}
+    for version in versions:
+        if version.normalized_item_id not in latest:
+            latest[version.normalized_item_id] = version
+    return latest
+
+
+def _historical_versions_by_item(session: Session, since: datetime, item_ids: list[int]) -> dict[int, ItemVersion]:
+    if not item_ids:
+        return {}
+    versions = session.scalars(
+        select(ItemVersion)
+        .where(ItemVersion.normalized_item_id.in_(item_ids), ItemVersion.changed_at < since)
         .order_by(ItemVersion.changed_at.desc(), ItemVersion.id.desc())
     ).all()
     latest: dict[int, ItemVersion] = {}
