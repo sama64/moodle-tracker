@@ -229,6 +229,7 @@ def test_moodle_files_extracts_under_size_limit_and_skips_over_limit(monkeypatch
     artifacts = verify_session.query(RawArtifact).order_by(RawArtifact.id).all()
     assert result["stats"] == {
         "files_downloaded": 1,
+        "files_reused": 0,
         "files_with_text": 1,
         "files_skipped_extraction": 0,
         "total_candidates": 1,
@@ -284,3 +285,121 @@ def test_extract_quiz_completion_state_falls_back_to_module_completion() -> None
 
     assert extract_quiz_completion_state(module, None) == COMPLETION_STATE_COMPLETED
     assert extract_quiz_completion_state({}, None) == COMPLETION_STATE_UNKNOWN
+
+
+def test_moodle_files_reuses_unchanged_archived_file(monkeypatch, tmp_path) -> None:
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    session = Session()
+    account = SourceAccount(
+        source_type="moodle",
+        label="default",
+        base_url="https://example.invalid",
+        auth_mode="token",
+        is_active=True,
+        auth_health="healthy",
+        metadata_json={},
+    )
+    session.add(account)
+    session.flush()
+    course = Course(
+        source_account_id=account.id,
+        external_id="101",
+        shortname="MAT",
+        fullname="Materiales",
+        display_name="Materiales",
+        course_url="https://example.invalid/course/101",
+        visible=True,
+        raw_payload={},
+        first_seen_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+    )
+    session.add(course)
+    session.flush()
+    session.add(
+        SourceObject(
+            source_account_id=account.id,
+            course_id=course.id,
+            external_id="module-1",
+            object_type="resource",
+            parent_external_id=course.external_id,
+            source_url="https://example.invalid/mod/resource/view.php?id=1",
+            current_hash="hash-1",
+            raw_payload={
+                "contents": [
+                    {
+                        "filename": "slides.pptx",
+                        "filepath": "/",
+                        "fileurl": "https://example.invalid/pluginfile.php/1/slides.pptx",
+                        "mimetype": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        "filesize": 16,
+                    }
+                ]
+            },
+            first_seen_at=datetime.now(UTC),
+            last_seen_at=datetime.now(UTC),
+        )
+    )
+    session.commit()
+    session.close()
+
+    downloaded_urls: list[str] = []
+
+    class FakeMoodleServiceClient:
+        def __init__(self, settings, session=None, source_account=None) -> None:
+            self.settings = settings
+
+        def download_file(self, url: str) -> bytes:
+            downloaded_urls.append(url)
+            return b"pptx bytes"
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("uni_tracker.collectors.moodle.MoodleServiceClient", FakeMoodleServiceClient)
+    settings = SimpleNamespace(
+        file_download_limit_per_run=1,
+        max_file_extract_bytes=1_000_000,
+        pdf_extraction_timeout_seconds=15,
+        pdf_extraction_memory_limit_mb=192,
+    )
+
+    first_session = Session()
+    collector = MoodleFilesCollector(
+        CollectorContext(
+            session=first_session,
+            settings=settings,
+            artifact_store=ArtifactStore(tmp_path / "runtime"),
+            source_account=first_session.get(SourceAccount, 1),
+        )
+    )
+    first = collector.run()
+    first_session.close()
+
+    second_session = Session()
+    collector = MoodleFilesCollector(
+        CollectorContext(
+            session=second_session,
+            settings=settings,
+            artifact_store=ArtifactStore(tmp_path / "runtime"),
+            source_account=second_session.get(SourceAccount, 1),
+        )
+    )
+    second = collector.run()
+    second_session.close()
+
+    verify_session = Session()
+    artifacts = verify_session.query(RawArtifact).filter_by(artifact_type="file").all()
+    assert first["stats"]["files_downloaded"] == 1
+    assert first["stats"]["files_reused"] == 0
+    assert second["stats"]["files_downloaded"] == 0
+    assert second["stats"]["files_reused"] == 1
+    assert downloaded_urls == ["https://example.invalid/pluginfile.php/1/slides.pptx"]
+    assert len(artifacts) == 1

@@ -7,9 +7,9 @@ from typing import Any
 from sqlalchemy import select
 
 from uni_tracker.collectors.base import BaseCollector
-from uni_tracker.models import Course, ItemFact, NormalizedItem, SourceObject
+from uni_tracker.models import Course, ItemFact, NormalizedItem, RawArtifact, SourceObject
 from uni_tracker.services.calendar import parse_ics_events
-from uni_tracker.services.moodle import MoodleError, MoodleServiceClient, epoch_to_datetime
+from uni_tracker.services.moodle import MoodleError, MoodleServiceClient, epoch_to_datetime, stable_hash
 from uni_tracker.services.notifications import schedule_notifications_for_item
 from uni_tracker.services.parsing import (
     ExtractedFact,
@@ -790,6 +790,7 @@ class MoodleFilesCollector(BaseCollector):
 
         downloaded = 0
         extracted = 0
+        reused = 0
         skipped_extraction = 0
         max_extract_bytes = getattr(self.context.settings, "max_file_extract_bytes", 3_000_000)
         pdf_timeout_seconds = getattr(self.context.settings, "pdf_extraction_timeout_seconds", 20.0)
@@ -797,20 +798,20 @@ class MoodleFilesCollector(BaseCollector):
         for batch_offset, (module, content) in enumerate(batch):
             url = content.get("fileurl")
             filename = content.get("filename") or "file"
-            bytes_content = client.download_file(url)
-            suffix = Path(filename).suffix or ".bin"
-            relative_path, content_hash, size_bytes = self.context.artifact_store.write_bytes(
-                f"moodle/files/{module.external_id}",
-                safe_filename(Path(filename).stem),
-                bytes_content,
-                suffix=suffix,
-            )
             raw_payload = {
                 "module_id": module.external_id,
                 "content": content,
                 "filename": filename,
             }
             file_external_id = f"{module.external_id}:{content.get('filepath') or '/'}:{filename}"
+            existing_file_object = self.context.session.scalar(
+                select(SourceObject).where(
+                    SourceObject.source_account_id == self.context.source_account.id,
+                    SourceObject.external_id == file_external_id,
+                    SourceObject.object_type == "module_file",
+                )
+            )
+            raw_payload_unchanged = bool(existing_file_object and existing_file_object.current_hash == stable_hash(raw_payload))
             file_object, _ = upsert_source_object(
                 self.context.session,
                 source_account_id=self.context.source_account.id,
@@ -821,58 +822,91 @@ class MoodleFilesCollector(BaseCollector):
                 source_url=url,
                 raw_payload=raw_payload,
             )
-            artifact = create_raw_artifact(
-                self.context.session,
-                collector_run_id=run.id,
-                source_object_id=file_object.id,
-                artifact_type="file",
-                mime_type=content.get("mimetype") or "application/octet-stream",
-                storage_path=relative_path,
-                content_hash=content_hash,
-                size_bytes=size_bytes,
-                source_url=url,
-                metadata_json={"collector": self.name, "filename": filename},
+            artifact: RawArtifact | None = None
+            existing_item = self.context.session.scalar(
+                select(NormalizedItem).where(
+                    NormalizedItem.source_object_id == file_object.id,
+                    NormalizedItem.item_type == "material_file",
+                )
             )
-            declared_size = int(content.get("filesize") or 0)
-            extract_size = max(declared_size, len(bytes_content))
-            if max_extract_bytes > 0 and extract_size > max_extract_bytes:
-                text, extraction_mode = None, "skipped_too_large"
-                review_status, review_reason = "needs_review", "extraction_skipped_too_large"
-                skipped_extraction += 1
+            if raw_payload_unchanged and existing_item:
+                artifact = self.context.session.scalar(
+                    select(RawArtifact)
+                    .where(
+                        RawArtifact.source_object_id == file_object.id,
+                        RawArtifact.artifact_type == "file",
+                        RawArtifact.source_url == url,
+                    )
+                    .order_by(RawArtifact.id.desc())
+                )
+            if artifact:
+                text = existing_item.body_text
+                review_status = existing_item.review_status
+                review_reason = existing_item.review_reason
+                facts = extract_date_facts_from_text(text) if text else []
+                reused += 1
             else:
-                text, extraction_mode = extract_text_for_file(
-                    filename,
-                    content.get("mimetype") or "",
-                    bytes_content,
-                    pdf_timeout_seconds=pdf_timeout_seconds,
-                    pdf_memory_limit_mb=pdf_memory_limit_mb,
-                )
-                review_status, review_reason = derive_review_status(filename, text)
-            facts: list[ExtractedFact] = []
-            if text:
-                text_path, text_hash, text_size = self.context.artifact_store.write_text(
+                bytes_content = client.download_file(url)
+                suffix = Path(filename).suffix or ".bin"
+                relative_path, content_hash, size_bytes = self.context.artifact_store.write_bytes(
                     f"moodle/files/{module.external_id}",
-                    safe_filename(Path(filename).stem) + "-text",
-                    text,
+                    safe_filename(Path(filename).stem),
+                    bytes_content,
+                    suffix=suffix,
                 )
-                create_raw_artifact(
+                artifact = create_raw_artifact(
                     self.context.session,
                     collector_run_id=run.id,
                     source_object_id=file_object.id,
-                    artifact_type="extracted_text",
-                    mime_type="text/plain",
-                    storage_path=text_path,
-                    content_hash=text_hash,
-                    size_bytes=text_size,
+                    artifact_type="file",
+                    mime_type=content.get("mimetype") or "application/octet-stream",
+                    storage_path=relative_path,
+                    content_hash=content_hash,
+                    size_bytes=size_bytes,
                     source_url=url,
-                    metadata_json={"collector": self.name, "extraction_mode": extraction_mode},
-                    extraction_status="completed",
+                    metadata_json={"collector": self.name, "filename": filename},
                 )
-                facts = extract_date_facts_from_text(text)
-                extracted += 1
-            elif extraction_mode == "failed":
-                review_status = "needs_review"
-                review_reason = "text_extraction_failed"
+                declared_size = int(content.get("filesize") or 0)
+                extract_size = max(declared_size, len(bytes_content))
+                if max_extract_bytes > 0 and extract_size > max_extract_bytes:
+                    text, extraction_mode = None, "skipped_too_large"
+                    review_status, review_reason = "needs_review", "extraction_skipped_too_large"
+                    skipped_extraction += 1
+                else:
+                    text, extraction_mode = extract_text_for_file(
+                        filename,
+                        content.get("mimetype") or "",
+                        bytes_content,
+                        pdf_timeout_seconds=pdf_timeout_seconds,
+                        pdf_memory_limit_mb=pdf_memory_limit_mb,
+                    )
+                    review_status, review_reason = derive_review_status(filename, text)
+                facts: list[ExtractedFact] = []
+                if text:
+                    text_path, text_hash, text_size = self.context.artifact_store.write_text(
+                        f"moodle/files/{module.external_id}",
+                        safe_filename(Path(filename).stem) + "-text",
+                        text,
+                    )
+                    create_raw_artifact(
+                        self.context.session,
+                        collector_run_id=run.id,
+                        source_object_id=file_object.id,
+                        artifact_type="extracted_text",
+                        mime_type="text/plain",
+                        storage_path=text_path,
+                        content_hash=text_hash,
+                        size_bytes=text_size,
+                        source_url=url,
+                        metadata_json={"collector": self.name, "extraction_mode": extraction_mode},
+                        extraction_status="completed",
+                    )
+                    facts = extract_date_facts_from_text(text)
+                    extracted += 1
+                elif extraction_mode == "failed":
+                    review_status = "needs_review"
+                    review_reason = "text_extraction_failed"
+                downloaded += 1
 
             due_candidates = [
                 datetime.fromisoformat(fact.value["value"])
@@ -907,7 +941,6 @@ class MoodleFilesCollector(BaseCollector):
             replace_item_facts(self.context.session, item=item, facts=facts, source_artifact_id=artifact.id)
             if state.state in {"created", "updated"}:
                 schedule_notifications_for_item(self.context.session, item, state)
-            downloaded += 1
             progress_index = (start_index + batch_offset + 1) % total_candidates if total_candidates else 0
             metadata["moodle_files_cursor"] = progress_index
             self.context.source_account.metadata_json = metadata
@@ -919,6 +952,7 @@ class MoodleFilesCollector(BaseCollector):
         run.checkpoint = {"start_index": start_index, "next_index": next_index, "total_candidates": total_candidates}
         return {
             "files_downloaded": downloaded,
+            "files_reused": reused,
             "files_with_text": extracted,
             "files_skipped_extraction": skipped_extraction,
             "total_candidates": total_candidates,
