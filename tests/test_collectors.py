@@ -14,10 +14,23 @@ from uni_tracker.collectors.moodle import (
     COMPLETION_STATE_UNKNOWN,
     MoodleFilesCollector,
     extract_quiz_completion_state,
+    is_inaccessible_course_error,
 )
 from uni_tracker.db import Base
 from uni_tracker.models import Course, RawArtifact, SourceAccount, SourceObject
 from uni_tracker.services.storage import ArtifactStore
+from uni_tracker.services.moodle import MoodleError
+
+
+def test_inaccessible_course_error_recognizes_moodle_course_churn() -> None:
+    assert is_inaccessible_course_error(
+        MoodleError("core_course_get_contents failed: Curso o actividad no accesible.")
+    )
+    assert is_inaccessible_course_error(
+        MoodleError("No puede ejecutar funciones en el contexto de curso (course id:20378).")
+    )
+    assert not is_inaccessible_course_error(MoodleError("Invalid token"))
+    assert not is_inaccessible_course_error(RuntimeError("Curso o actividad no accesible."))
 
 
 def test_moodle_files_cursor_persists_between_runs(monkeypatch, tmp_path) -> None:

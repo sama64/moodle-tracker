@@ -45,6 +45,26 @@ COMPLETION_STATE_INCOMPLETE = "incomplete"
 COMPLETION_STATE_COMPLETED = "completed"
 
 
+def is_inaccessible_course_error(exc: Exception) -> bool:
+    """Return whether Moodle rejected access to one archived/unavailable course.
+
+    Course enrollment churn is normal between cuatrimestres. A stale local course
+    must not prevent collectors from processing newly enrolled active courses.
+    """
+    if not isinstance(exc, MoodleError):
+        return False
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "curso o actividad no accesible",
+            "course or activity not accessible",
+            "no puede ejecutar funciones en el contexto de curso",
+            "cannot execute functions in the course context",
+        )
+    )
+
+
 def module_item_type(modname: str) -> str:
     return MODULE_TO_ITEM_TYPE.get(modname, modname)
 
@@ -262,9 +282,16 @@ class MoodleCourseContentsCollector(BaseCollector):
         created_items = 0
         updated_items = 0
         removed_objects = 0
+        skipped_inaccessible_courses: list[str] = []
         try:
             for course in courses:
-                contents = client.get_course_contents(int(course.external_id))
+                try:
+                    contents = client.get_course_contents(int(course.external_id))
+                except MoodleError as exc:
+                    if not is_inaccessible_course_error(exc):
+                        raise
+                    skipped_inaccessible_courses.append(course.external_id)
+                    continue
                 relative_path, content_hash, size_bytes = self.context.artifact_store.write_json(
                     f"moodle/course_contents/{course.external_id}",
                     "contents",
@@ -315,6 +342,7 @@ class MoodleCourseContentsCollector(BaseCollector):
                 "items_created": created_items,
                 "items_updated": updated_items,
                 "removed_objects": removed_objects,
+                "skipped_inaccessible_courses": skipped_inaccessible_courses,
             }
         finally:
             client.close()
@@ -392,9 +420,16 @@ class MoodleCourseUpdatesCollector(BaseCollector):
         courses = self.context.session.scalars(select(Course).order_by(Course.id)).all()
         changed_course_ids: set[int] = set()
         changed_module_ids: set[str] = set()
+        skipped_inaccessible_courses: list[str] = []
         try:
             for course in courses:
-                payload = client.get_updates_since(int(course.external_id), since)
+                try:
+                    payload = client.get_updates_since(int(course.external_id), since)
+                except MoodleError as exc:
+                    if not is_inaccessible_course_error(exc):
+                        raise
+                    skipped_inaccessible_courses.append(course.external_id)
+                    continue
                 relative_path, content_hash, size_bytes = self.context.artifact_store.write_json(
                     f"moodle/updates/{course.external_id}",
                     "updates",
@@ -421,7 +456,14 @@ class MoodleCourseUpdatesCollector(BaseCollector):
                 contents_collector = MoodleCourseContentsCollector(self.context)
                 for course in courses:
                     if course.id in changed_course_ids:
-                        contents = client.get_course_contents(int(course.external_id))
+                        try:
+                            contents = client.get_course_contents(int(course.external_id))
+                        except MoodleError as exc:
+                            if not is_inaccessible_course_error(exc):
+                                raise
+                            if course.external_id not in skipped_inaccessible_courses:
+                                skipped_inaccessible_courses.append(course.external_id)
+                            continue
                         for section in contents:
                             for module in section.get("modules", []):
                                 if str(module["id"]) in changed_module_ids:
@@ -435,6 +477,7 @@ class MoodleCourseUpdatesCollector(BaseCollector):
                 "courses_checked": len(courses),
                 "changed_courses": len(changed_course_ids),
                 "changed_modules": len(changed_module_ids),
+                "skipped_inaccessible_courses": skipped_inaccessible_courses,
             }
         finally:
             client.close()
@@ -635,8 +678,15 @@ class MoodleGradesCollector(BaseCollector):
     def collect(self, run) -> dict[str, Any]:
         client = MoodleServiceClient(self.context.settings, session=self.context.session, source_account=self.context.source_account)
         processed = 0
+        skipped_inaccessible_courses: list[str] = []
         for course in self.context.session.scalars(select(Course).order_by(Course.id)).all():
-            payload = client.get_grade_items(int(course.external_id))
+            try:
+                payload = client.get_grade_items(int(course.external_id))
+            except MoodleError as exc:
+                if not is_inaccessible_course_error(exc):
+                    raise
+                skipped_inaccessible_courses.append(course.external_id)
+                continue
             relative_path, content_hash, size_bytes = self.context.artifact_store.write_json(
                 f"moodle/grades/{course.external_id}",
                 "grade_items",
@@ -682,7 +732,10 @@ class MoodleGradesCollector(BaseCollector):
                     schedule_notifications_for_item(self.context.session, item, state)
                 processed += 1
         client.close()
-        return {"grade_items_processed": processed}
+        return {
+            "grade_items_processed": processed,
+            "skipped_inaccessible_courses": skipped_inaccessible_courses,
+        }
 
 
 class MoodleCalendarCollector(BaseCollector):
