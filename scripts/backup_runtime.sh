@@ -34,6 +34,11 @@ docker compose exec -T db pg_dump \
   -d "${POSTGRES_DB:-uni_tracker}" > "${TMP_DIR}/uni_tracker.dump"
 cp "${ENV_FILE}" "${TMP_DIR}/deployment.env"
 chmod 600 "${TMP_DIR}/deployment.env" "${TMP_DIR}/uni_tracker.dump"
+if [[ -f "${HOME}/.config/exam-calendar/academic-state.yaml" ]]; then
+  mkdir -p "${TMP_DIR}/exam-calendar"
+  cp "${HOME}/.config/exam-calendar/academic-state.yaml" "${TMP_DIR}/exam-calendar/academic-state.yaml"
+  chmod 600 "${TMP_DIR}/exam-calendar/academic-state.yaml"
+fi
 
 if ! restic snapshots --tag moodle-tracker >/dev/null 2>&1; then
   restic init

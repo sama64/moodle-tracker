@@ -31,4 +31,9 @@ docker compose exec -T db pg_restore \
   -U "${POSTGRES_USER:-uni_tracker}" \
   -d "${POSTGRES_DB:-uni_tracker}" < "${DUMP_PATH}"
 
+CALENDAR_STATE="$(find "${TMP_DIR}" -type f -path '*/exam-calendar/academic-state.yaml' -print -quit)"
+if [[ -n "${CALENDAR_STATE}" ]]; then
+  install -D -m 0644 "${CALENDAR_STATE}" "${HOME}/.config/exam-calendar/academic-state.yaml"
+fi
+
 echo "Restore completed from encrypted snapshot ${SNAPSHOT}"
