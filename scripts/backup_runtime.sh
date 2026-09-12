@@ -39,6 +39,6 @@ if ! restic snapshots --tag moodle-tracker >/dev/null 2>&1; then
   restic init
 fi
 restic backup "${TMP_DIR}" --tag moodle-tracker --tag "${STAMP}"
-restic forget --tag moodle-tracker --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+restic forget --tag moodle-tracker --group-by host --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
 
 echo "Encrypted Moodle tracker backup completed at ${STAMP}"
