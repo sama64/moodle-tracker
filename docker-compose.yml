@@ -2,12 +2,19 @@ services:
   db:
     image: postgres:16
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      POSTGRES_DB: uni_tracker
-      POSTGRES_USER: uni_tracker
-      POSTGRES_PASSWORD: uni_tracker
+      POSTGRES_DB: ${POSTGRES_DB:-uni_tracker}
+      POSTGRES_USER: ${POSTGRES_USER:-uni_tracker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured}
     volumes:
       - uni_tracker_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   api:
     build: .
@@ -24,10 +31,17 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     command: >
       bash -lc "alembic upgrade head &&
       uvicorn uni_tracker.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 10
+      start_period: 20s
 
   worker:
     build: .
@@ -45,10 +59,12 @@ services:
       - ./data/uni-tracker:/app/data/uni-tracker
       - ./data/uni-tracker/artifacts/runtime:/app/artifacts/runtime
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
     command: >
-      bash -lc "alembic upgrade head &&
-      python -m uni_tracker.worker"
+      python -m uni_tracker.worker
 
 volumes:
   uni_tracker_postgres_data:

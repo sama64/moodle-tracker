@@ -16,7 +16,6 @@ API_BASE = os.environ.get('MOODLE_TRACKER_API', 'http://localhost:8000')
 STATE_DIR = Path.home() / '.hermes' / 'state'
 CURSOR_PATH = STATE_DIR / 'moodle_tracker_cursor.txt'
 DEADLINE_REMINDER_PATH = STATE_DIR / 'moodle_tracker_deadline_reminders.json'
-SCHEDULE_REMINDER_PATH = STATE_DIR / 'moodle_tracker_schedule_reminders.json'
 TZ = ZoneInfo('America/Argentina/Buenos_Aires')
 URGENT_DEADLINE_WINDOW_HOURS = 24
 # Exams/schedule dates need earlier heads-up than ordinary deadlines, but not a
@@ -27,7 +26,7 @@ EXAM_REMINDER_BUCKETS_HOURS = (
 )
 # Schedule documents often only give a date, not a time. Those must be handled
 # as all-day academic risks; otherwise a date-only exam becomes "past" at
-# 00:00 and we never send the same-day heads-up Santiago actually needs.
+# 00:00 and we never send the same-day heads-up Sam actually needs.
 EXAM_REMINDER_BUCKETS_DAYS = (
     ('three_days_before', 3),
     ('day_before', 1),
@@ -355,7 +354,7 @@ def is_non_course_announcement(item: dict, course_map: dict[int, str]) -> bool:
 
 
 def is_actionable_change(item: dict, now_utc: datetime, course_map: dict[int, str]) -> bool:
-    """Return True only for changes worth interrupting Santiago about.
+    """Return True only for changes worth interrupting Sam about.
 
     Moodle emits lots of low-signal resource churn (class PDFs, tables, generic
     forum containers). Keep those out of Telegram unless they affect deadlines,
@@ -504,7 +503,10 @@ def main() -> int:
     reminder_state = {k: v for k, v in reminder_state.items() if k in active_reminder_keys}
     save_reminder_state(reminder_state)
 
-    schedule_state = load_json_state(SCHEDULE_REMINDER_PATH)
+    # Resolve this from STATE_DIR at runtime so test/deployment state roots stay
+    # coherent when STATE_DIR is overridden.
+    schedule_reminder_path = STATE_DIR / 'moodle_tracker_schedule_reminders.json'
+    schedule_state = load_json_state(schedule_reminder_path)
     urgent_schedule_events = []
     active_schedule_keys = set()
     for event in extract_schedule_events(risks, now_utc):
@@ -519,7 +521,7 @@ def main() -> int:
         urgent_schedule_events.append(event)
         schedule_state[key] = now_utc.isoformat().replace('+00:00', 'Z')
     schedule_state = prune_schedule_state(schedule_state, active_schedule_keys, now_utc)
-    save_json_state(SCHEDULE_REMINDER_PATH, schedule_state)
+    save_json_state(schedule_reminder_path, schedule_state)
 
     lines = []
     if urgent_deadlines:

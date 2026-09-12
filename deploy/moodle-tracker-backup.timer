@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted Moodle Tracker backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=moodle-tracker-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -48,9 +48,13 @@ Common optional settings:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `ENABLE_LLM`
-- `NVIDIA_API_KEY`
-- `NVIDIA_API_URL`
-- `NVIDIA_MODEL`
+- `LLM_PROVIDER`
+- `LLM_API_KEY`
+- `LLM_API_URL`
+- `LLM_MODEL`
+
+The generic LLM settings accept OpenAI-compatible chat completion providers.
+The legacy `NVIDIA_*` variables remain supported when `LLM_API_KEY` is unset.
 
 Time handling:
 
@@ -168,6 +172,23 @@ Compile check:
 ```bash
 python -m compileall -q src scripts
 ```
+
+## Encrypted Backups
+
+`scripts/backup_runtime.sh` creates an encrypted restic snapshot containing a
+PostgreSQL custom-format dump and the deployment environment. It uses the
+configured R2 credentials and stores snapshots below
+`backups/production-v2`. The restic password defaults to
+`~/.config/moodle-tracker/restic-password` and must also be kept outside the
+VPS.
+
+```bash
+scripts/backup_runtime.sh
+scripts/restore_encrypted_backup.sh latest
+```
+
+The supplied systemd timer runs the backup daily and retains 7 daily, 4 weekly,
+and 6 monthly snapshots.
 
 ## Notes
 

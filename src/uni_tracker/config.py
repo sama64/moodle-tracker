@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     llm_retry_base_delay_seconds: float = Field(default=2.0, alias="LLM_RETRY_BASE_DELAY_SECONDS")
     llm_retry_max_delay_seconds: float = Field(default=30.0, alias="LLM_RETRY_MAX_DELAY_SECONDS")
     llm_retry_cooldown_minutes: int = Field(default=180, alias="LLM_RETRY_COOLDOWN_MINUTES")
+    llm_provider: str | None = Field(default=None, alias="LLM_PROVIDER")
+    llm_api_key: str | None = Field(default=None, alias="LLM_API_KEY")
+    llm_api_url: str | None = Field(default=None, alias="LLM_API_URL")
+    llm_model: str | None = Field(default=None, alias="LLM_MODEL")
+    # Backward-compatible NVIDIA configuration. New deployments should use the
+    # generic LLM_* variables above.
     nvidia_api_key: str | None = Field(default=None, alias="NVIDIA_API_KEY")
     nvidia_api_url: str = Field(
         default="https://integrate.api.nvidia.com/v1/chat/completions",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -22,22 +23,69 @@ class LLMUnavailable(RuntimeError):
 SUMMARY_FINAL_STATUSES = {"completed", "rejected"}
 
 
-def build_nvidia_client(*, timeout_seconds: float = 60.0) -> httpx.Client:
-    settings = get_settings()
-    if not settings.nvidia_api_key:
-        raise LLMUnavailable("NVIDIA_API_KEY is not configured.")
+@dataclass(frozen=True)
+class LLMConfig:
+    provider: str
+    api_key: str
+    api_url: str
+    model: str
+
+    @property
+    def extractor_type(self) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", self.model.casefold()).strip("_")
+        return f"llm_{slug or self.provider}"
+
+
+def resolve_llm_config(settings: Any) -> LLMConfig | None:
+    generic_key = getattr(settings, "llm_api_key", None)
+    if generic_key:
+        provider = str(getattr(settings, "llm_provider", None) or "openai_compatible").strip().casefold()
+        model = str(getattr(settings, "llm_model", None) or "").strip()
+        api_url = str(getattr(settings, "llm_api_url", None) or "").strip()
+        if not model or not api_url:
+            raise LLMUnavailable("LLM_MODEL and LLM_API_URL are required when LLM_API_KEY is configured.")
+        return LLMConfig(
+            provider=provider,
+            api_key=str(generic_key),
+            api_url=_chat_completions_url(api_url),
+            model=model,
+        )
+
+    legacy_key = getattr(settings, "nvidia_api_key", None)
+    if not legacy_key:
+        return None
+    return LLMConfig(
+        provider="nvidia",
+        api_key=str(legacy_key),
+        api_url=_chat_completions_url(str(settings.nvidia_api_url)),
+        model=str(settings.nvidia_model),
+    )
+
+
+def _chat_completions_url(api_url: str) -> str:
+    normalized = api_url.rstrip("/")
+    if normalized.endswith("/chat/completions"):
+        return normalized
+    return f"{normalized}/chat/completions"
+
+
+def build_llm_client(config: LLMConfig, *, timeout_seconds: float = 60.0) -> httpx.Client:
     return httpx.Client(
         timeout=timeout_seconds,
         headers={
-            "Authorization": f"Bearer {settings.nvidia_api_key}",
+            "Authorization": f"Bearer {config.api_key}",
             "Accept": "application/json",
+            "Content-Type": "application/json",
         },
     )
 
 
 def enrich_recent_items(session: Session, limit: int = 10) -> dict[str, int]:
     settings = get_settings()
-    if not settings.enable_llm or not settings.nvidia_api_key:
+    if not settings.enable_llm:
+        return {"processed": 0, "skipped": 0}
+    config = resolve_llm_config(settings)
+    if config is None:
         return {"processed": 0, "skipped": 0}
 
     items = session.scalars(
@@ -53,13 +101,14 @@ def enrich_recent_items(session: Session, limit: int = 10) -> dict[str, int]:
         return {"processed": 0, "skipped": 0}
 
     processed = 0
-    with build_nvidia_client() as client:
+    with build_llm_client(config) as client:
         for item in items:
             outcome = _process_item_brief(
                 session=session,
                 client=client,
                 item=item,
                 settings=settings,
+                config=config,
                 force=False,
                 origin="stored",
             )
@@ -70,19 +119,23 @@ def enrich_recent_items(session: Session, limit: int = 10) -> dict[str, int]:
 
 def backfill_item_briefs(session: Session, items: list[NormalizedItem], *, force: bool = True) -> dict[str, int]:
     settings = get_settings()
-    if not settings.enable_llm or not settings.nvidia_api_key:
+    if not settings.enable_llm:
+        return {"processed": 0, "skipped": len(items)}
+    config = resolve_llm_config(settings)
+    if config is None:
         return {"processed": 0, "skipped": len(items)}
     if not items:
         return {"processed": 0, "skipped": 0}
 
     processed = 0
-    with build_nvidia_client(timeout_seconds=180.0) as client:
+    with build_llm_client(config, timeout_seconds=180.0) as client:
         for item in items:
             outcome = _process_item_brief(
                 session=session,
                 client=client,
                 item=item,
                 settings=settings,
+                config=config,
                 force=force,
                 origin="backfill",
             )
@@ -168,6 +221,7 @@ def _process_item_brief(
     client: httpx.Client,
     item: NormalizedItem,
     settings,
+    config: LLMConfig,
     force: bool,
     origin: str,
 ) -> str:
@@ -181,8 +235,8 @@ def _process_item_brief(
         normalized_item_id=item.id,
         raw_artifact_id=None,
         job_type="summary",
-        provider="nvidia",
-        model=settings.nvidia_model,
+        provider=config.provider,
+        model=config.model,
         status="running",
         request_payload={"prompt": prompt},
     )
@@ -192,16 +246,8 @@ def _process_item_brief(
         response, attempts = _post_with_retries(
             client=client,
             settings=settings,
-            url=settings.nvidia_api_url,
-            request_json={
-                "model": settings.nvidia_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1200,
-                "temperature": 0.2,
-                "top_p": 1.0,
-                "stream": False,
-                "chat_template_kwargs": {"thinking": True},
-            },
+            url=config.api_url,
+            request_json=_build_request_payload(config, prompt),
         )
         response.raise_for_status()
         payload = response.json()
@@ -229,7 +275,7 @@ def _process_item_brief(
                 fact_type="llm_summary",
                 value_json={"summary": brief_payload["summary_short"]},
                 confidence=0.5,
-                extractor_type="llm_kimi_k2_5",
+                extractor_type=config.extractor_type,
                 source_span=item.title,
             )
         )
@@ -247,7 +293,7 @@ def _process_item_brief(
                         "matched_text": date_fact.get("matched_text"),
                     },
                     confidence=0.45,
-                    extractor_type="llm_kimi_k2_5",
+                    extractor_type=config.extractor_type,
                     source_span=date_fact.get("matched_text"),
                 )
             )
@@ -260,7 +306,7 @@ def _process_item_brief(
                     fact_type="llm_urgent_signals",
                     value_json={"signals": risk_flags},
                     confidence=0.45,
-                    extractor_type="llm_kimi_k2_5",
+                    extractor_type=config.extractor_type,
                     source_span=item.title,
                 )
             )
@@ -268,7 +314,7 @@ def _process_item_brief(
             session,
             item=item,
             payload=brief_payload,
-            model=settings.nvidia_model,
+            model=config.model,
             llm_job_id=job.id,
             source_artifact_id=None,
             origin=origin,
@@ -306,7 +352,7 @@ def _post_with_retries(
             response = client.post(url, json=request_json)
             if _is_retryable_response(response) and attempt < max_attempts:
                 last_error = httpx.HTTPStatusError(
-                    f"Retryable NVIDIA status: {response.status_code}",
+                    f"Retryable LLM status: {response.status_code}",
                     request=response.request,
                     response=response,
                 )
@@ -324,6 +370,22 @@ def _post_with_retries(
     if last_error is not None:
         raise last_error
     raise RuntimeError("LLM request failed without response")
+
+
+def _build_request_payload(config: LLMConfig, prompt: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": config.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1200,
+        "temperature": 0.2,
+        "top_p": 1.0,
+        "stream": False,
+    }
+    if config.provider == "deepseek":
+        payload["response_format"] = {"type": "json_object"}
+    elif config.provider == "nvidia":
+        payload["chat_template_kwargs"] = {"thinking": True}
+    return payload
 
 
 def _validate_brief_payload(item: NormalizedItem, payload: dict[str, Any]) -> str | None:

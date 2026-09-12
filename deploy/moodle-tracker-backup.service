@@ -1,0 +1,12 @@
+[Unit]
+Description=Encrypted Moodle Tracker backup to Cloudflare R2
+Requires=moodle-tracker.service
+After=moodle-tracker.service network-online.target
+
+[Service]
+Type=oneshot
+User=sam
+Group=sam
+WorkingDirectory=/home/sam/services/moodle-tracker
+ExecStart=/home/sam/services/moodle-tracker/scripts/backup_runtime.sh
+Nice=10
