@@ -418,6 +418,66 @@ def test_main_still_alerts_on_actionable_new_assignment(tmp_path, capsys):
     assert any("Entrega TP N°5" in line for line in payload["lines"])
 
 
+def test_stale_new_announcement_is_treated_as_backfill():
+    module = load_watch_module()
+    now_utc = module.datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    item = {
+        "item_type": "announcement",
+        "change_kind": "new",
+        "published_at": "2026-08-11T02:53:40Z",
+        "starts_at": None,
+        "due_at": None,
+    }
+
+    assert module.is_stale_new_backfill(item, now_utc) is True
+
+
+def test_recent_announcement_repeating_known_exam_date_is_suppressed():
+    module = load_watch_module()
+    now_utc = module.datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    announcement = {
+        "id": 219,
+        "course_id": 2,
+        "item_type": "announcement",
+        "title": "Primer Parcial",
+        "body_text": "Este miércoles 30 de septiembre es el Primer Parcial de Cálculo I.",
+    }
+    risks = [{
+        "id": 164,
+        "course_id": 2,
+        "item_type": "material_file",
+        "title": "Cronograma CALCULO I 2do.Cuat. 2026.pdf",
+        "body_text": "25/09 Clase de consultas 30/09 Primer Parcial 02/10 Funciones vectoriales",
+        "review_status": "watch",
+        "review_reason": "high_risk_schedule_document",
+    }]
+
+    assert module.announcement_repeats_known_schedule(announcement, risks, now_utc) is True
+
+
+def test_exam_announcement_with_changed_room_is_not_suppressed():
+    module = load_watch_module()
+    now_utc = module.datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)
+    announcement = {
+        "id": 220,
+        "course_id": 2,
+        "item_type": "announcement",
+        "title": "Cambio de aula — Primer Parcial",
+        "body_text": "El parcial del 30 de septiembre cambia al aula 14.",
+    }
+    risks = [{
+        "id": 164,
+        "course_id": 2,
+        "item_type": "material_file",
+        "title": "Cronograma Cálculo I",
+        "body_text": "30/09 Primer Parcial",
+        "review_status": "watch",
+        "review_reason": "high_risk_schedule_document",
+    }]
+
+    assert module.announcement_repeats_known_schedule(announcement, risks, now_utc) is False
+
+
 def test_main_keeps_existing_schedule_reminder_state_when_risks_temporarily_empty(tmp_path, capsys, monkeypatch):
     module = load_watch_module()
 

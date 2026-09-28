@@ -34,9 +34,22 @@ EXAM_REMINDER_BUCKETS_DAYS = (
 )
 URGENT_SCHEDULE_WINDOW_HOURS = max(hours for _, hours in EXAM_REMINDER_BUCKETS_HOURS)
 ACTIONABLE_DEADLINE_WINDOW_DAYS = 14
+BACKFILL_PUBLICATION_MAX_AGE_DAYS = 7
 EXAM_WORDS = ('parcial', 'recuperatorio', 'examen')
 SCHEDULE_TITLE_WORDS = ('cronograma', 'calendario', 'horario', 'fechas')
 DATE_RE = re.compile(r'\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?(?:\s*(?:de\s*)?(\d{1,2})[:.](\d{2}))?', re.I)
+SPANISH_DATE_RE = re.compile(
+    r'\b(\d{1,2})\s+de\s+'
+    r'(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)'
+    r'(?:\s+de\s+(\d{4}))?',
+    re.I,
+)
+SPANISH_MONTHS = {
+    'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4,
+    'mayo': 5, 'junio': 6, 'julio': 7, 'agosto': 8,
+    'septiembre': 9, 'setiembre': 9, 'octubre': 10,
+    'noviembre': 11, 'diciembre': 12,
+}
 IMPORTANT_TITLE_KEYWORDS = (
     'parcial', 'recuperatorio', 'examen', 'entrega', 'vence', 'vencimiento',
     'cuestionario', 'quiz', 'tp', 'trabajo práctico', 'trabajo practico',
@@ -332,6 +345,66 @@ def _hours_until(value: str | None, now_utc: datetime) -> float | None:
     return (dt - now_utc).total_seconds() / 3600
 
 
+def is_stale_new_backfill(item: dict, now_utc: datetime) -> bool:
+    """Suppress old Moodle posts that are merely discovered late."""
+    if item.get('change_kind') != 'new':
+        return False
+    if item.get('due_at') or item.get('starts_at'):
+        return False
+    published = parse_dt(item.get('published_at'))
+    if published is None:
+        return False
+    return now_utc - published > timedelta(days=BACKFILL_PUBLICATION_MAX_AGE_DAYS)
+
+
+def extract_calendar_dates(text: str, current_year: int) -> set[tuple[int, int, int]]:
+    dates: set[tuple[int, int, int]] = set()
+    for match in DATE_RE.finditer(text or ''):
+        day = int(match.group(1))
+        month = int(match.group(2))
+        year = int(match.group(3)) if match.group(3) else current_year
+        if year < 100:
+            year += 2000
+        try:
+            datetime(year, month, day)
+        except ValueError:
+            continue
+        dates.add((year, month, day))
+    for match in SPANISH_DATE_RE.finditer(text or ''):
+        day = int(match.group(1))
+        month = SPANISH_MONTHS[match.group(2).lower()]
+        year = int(match.group(3) or current_year)
+        try:
+            datetime(year, month, day)
+        except ValueError:
+            continue
+        dates.add((year, month, day))
+    return dates
+
+
+def announcement_repeats_known_schedule(item: dict, risks: list[dict], now_utc: datetime) -> bool:
+    """Suppress announcements that only restate an already tracked exam date."""
+    if item.get('item_type') not in {'announcement', 'forum_discussion', 'forum_post'}:
+        return False
+    blob = _text_blob(item)
+    if not any(word in blob for word in EXAM_WORDS):
+        return False
+    if any(word in blob for word in ('cambio', 'modific', 'suspend', 'reprogram', 'aula', 'horario')):
+        return False
+    year = now_utc.astimezone(TZ).year
+    announced_dates = extract_calendar_dates(blob, year)
+    if not announced_dates:
+        return False
+    known_dates: set[tuple[int, int, int]] = set()
+    for risk in risks:
+        if risk.get('id') == item.get('id') or risk.get('course_id') != item.get('course_id'):
+            continue
+        if not looks_like_schedule_doc(risk):
+            continue
+        known_dates.update(extract_calendar_dates(schedule_text(risk), year))
+    return announced_dates.issubset(known_dates)
+
+
 def announcement_context(item: dict) -> str | None:
     body = ' '.join(str(item.get('body_text') or '').split())
     if not body:
@@ -440,6 +513,12 @@ def main() -> int:
         item_type = item.get('item_type')
         # Skip mirrored calendar rows that usually duplicate a real assignment/quiz.
         if item_type == 'calendar_event' and ('está en fecha de entrega' in title or title.endswith(' cierra')):
+            continue
+        if is_stale_new_backfill(item, now_utc):
+            low_priority_count += 1
+            continue
+        if announcement_repeats_known_schedule(item, risks, now_utc):
+            low_priority_count += 1
             continue
         if not is_actionable_change(item, now_utc, course_map):
             low_priority_count += 1
