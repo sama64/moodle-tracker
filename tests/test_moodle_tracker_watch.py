@@ -478,6 +478,55 @@ def test_exam_announcement_with_changed_room_is_not_suppressed():
     assert module.announcement_repeats_known_schedule(announcement, risks, now_utc) is False
 
 
+def test_watch_suppresses_changes_and_deadlines_for_ignored_course(tmp_path, capsys):
+    module = load_watch_module()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    now_utc = module.datetime.now(timezone.utc)
+    cursor_path = state_dir / "moodle_tracker_cursor.txt"
+    cursor_path.write_text((now_utc - timedelta(hours=1)).isoformat().replace("+00:00", "Z"))
+
+    def fake_fetch(path: str, method: str = "GET", data=None):
+        if path == "/courses":
+            return [{"id": 3, "display_name": "Mecánica de los Materiales"}]
+        if path == "/health/details":
+            return {"details": {"stale_collectors": [], "source_auth_health": "healthy"}}
+        if path == "/deadlines/upcoming":
+            return [{
+                "id": 214,
+                "course_id": 3,
+                "title": "Entrega TP Nº4",
+                "due_at": (now_utc + timedelta(hours=4)).isoformat().replace("+00:00", "Z"),
+                "completion_state": "unknown",
+            }]
+        if path == "/risks":
+            return []
+        if path.startswith("/changes/since?"):
+            return [{
+                "id": 214,
+                "course_id": 3,
+                "item_type": "assignment",
+                "title": "Entrega TP Nº4",
+                "updated_at": now_utc.isoformat().replace("+00:00", "Z"),
+                "meaningful_change": True,
+                "change_kind": "new",
+                "due_at": (now_utc + timedelta(hours=4)).isoformat().replace("+00:00", "Z"),
+            }]
+        raise AssertionError(f"Unexpected path: {path} method={method}")
+
+    setattr(module, "STATE_DIR", state_dir)
+    setattr(module, "CURSOR_PATH", cursor_path)
+    setattr(module, "DEADLINE_REMINDER_PATH", state_dir / "moodle_tracker_deadline_reminders.json")
+    setattr(module, "IGNORED_COURSE_IDS", {3})
+    setattr(module, "fetch", fake_fetch)
+
+    assert module.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["send_update"] is False
+    assert payload["meaningful_count"] == 0
+    assert payload["lines"] == []
+
+
 def test_main_keeps_existing_schedule_reminder_state_when_risks_temporarily_empty(tmp_path, capsys, monkeypatch):
     module = load_watch_module()
 

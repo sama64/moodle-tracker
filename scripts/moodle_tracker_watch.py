@@ -13,6 +13,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 API_BASE = os.environ.get('MOODLE_TRACKER_API', 'http://localhost:8000')
+IGNORED_COURSE_IDS = {
+    int(value.strip())
+    for value in os.environ.get('MOODLE_IGNORED_COURSE_IDS', '').split(',')
+    if value.strip().isdigit()
+}
 STATE_DIR = Path.home() / '.hermes' / 'state'
 CURSOR_PATH = STATE_DIR / 'moodle_tracker_cursor.txt'
 DEADLINE_REMINDER_PATH = STATE_DIR / 'moodle_tracker_deadline_reminders.json'
@@ -35,7 +40,7 @@ EXAM_REMINDER_BUCKETS_DAYS = (
 URGENT_SCHEDULE_WINDOW_HOURS = max(hours for _, hours in EXAM_REMINDER_BUCKETS_HOURS)
 ACTIONABLE_DEADLINE_WINDOW_DAYS = 14
 BACKFILL_PUBLICATION_MAX_AGE_DAYS = 7
-EXAM_WORDS = ('parcial', 'recuperatorio', 'examen')
+EXAM_RE = re.compile(r'\b(?:parcial|recuperatorio|examen)\b', re.I)
 SCHEDULE_TITLE_WORDS = ('cronograma', 'calendario', 'horario', 'fechas')
 DATE_RE = re.compile(r'\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?(?:\s*(?:de\s*)?(\d{1,2})[:.](\d{2}))?', re.I)
 SPANISH_DATE_RE = re.compile(
@@ -279,21 +284,20 @@ def extract_schedule_events(risks: list[dict], now_utc: datetime) -> list[dict]:
         if not looks_like_schedule_doc(item):
             continue
         text = schedule_text(item)
-        if not any(word in text.lower() for word in EXAM_WORDS):
+        if not EXAM_RE.search(text):
             continue
         for match in DATE_RE.finditer(text):
             start = max(match.start() - 45, 0)
             end = min(match.end() + 55, len(text))
             context = text[start:end]
             lowered_context = context.lower()
-            if not any(word in lowered_context for word in EXAM_WORDS):
+            if not EXAM_RE.search(lowered_context):
                 continue
             before = text[max(match.start() - 35, 0):match.start()].lower()
             after = text[match.end():min(match.end() + 45, len(text))].lower()
-            if not any(word in after for word in EXAM_WORDS):
+            if not EXAM_RE.search(after):
                 continue
-            after_lower = after.lower()
-            exam_positions = [after_lower.find(word) for word in EXAM_WORDS if word in after_lower]
+            exam_positions = [exam_match.start() for exam_match in EXAM_RE.finditer(after)]
             if exam_positions and DATE_RE.search(after[:min(exam_positions)]):
                 continue
             day = int(match.group(1))
@@ -387,7 +391,7 @@ def announcement_repeats_known_schedule(item: dict, risks: list[dict], now_utc: 
     if item.get('item_type') not in {'announcement', 'forum_discussion', 'forum_post'}:
         return False
     blob = _text_blob(item)
-    if not any(word in blob for word in EXAM_WORDS):
+    if not EXAM_RE.search(blob):
         return False
     if any(word in blob for word in ('cambio', 'modific', 'suspend', 'reprogram', 'aula', 'horario')):
         return False
@@ -412,7 +416,7 @@ def announcement_context(item: dict) -> str | None:
     sentences = re.split(r'(?<=[.!?])\s+', body)
     for sentence in sentences:
         low = sentence.lower()
-        if any(word in low for word in EXAM_WORDS) or DATE_RE.search(sentence):
+        if EXAM_RE.search(low) or DATE_RE.search(sentence):
             return sentence[:220]
     return body[:160]
 
@@ -507,6 +511,9 @@ def main() -> int:
     for item in changes:
         if not item.get('meaningful_change'):
             continue
+        if item.get('course_id') in IGNORED_COURSE_IDS:
+            low_priority_count += 1
+            continue
         if item.get('change_kind') == 'refresh_only':
             continue
         title = (item.get('title') or '').lower()
@@ -564,6 +571,8 @@ def main() -> int:
     urgent_deadlines = []
     active_reminder_keys = set()
     for item in deadlines:
+        if item.get('course_id') in IGNORED_COURSE_IDS:
+            continue
         if item.get('completion_state') == 'completed':
             continue
         due_dt = parse_dt(item.get('due_at'))
@@ -588,7 +597,8 @@ def main() -> int:
     schedule_state = load_json_state(schedule_reminder_path)
     urgent_schedule_events = []
     active_schedule_keys = set()
-    for event in extract_schedule_events(risks, now_utc):
+    active_risks = [risk for risk in risks if risk.get('course_id') not in IGNORED_COURSE_IDS]
+    for event in extract_schedule_events(active_risks, now_utc):
         bucket = exam_reminder_bucket(event, now_utc)
         if bucket is None:
             continue

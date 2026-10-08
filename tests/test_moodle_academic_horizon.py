@@ -62,3 +62,40 @@ def test_horizon_uses_item_content_extracted_text_for_schedule_doc_parciales(mon
     assert payload["send_update"] is True
     assert payload["schedule_event_count"] == 1
     assert any("PARCIAL 2" in line and "28/04" in line for line in payload["lines"])
+
+
+def test_horizon_suppresses_deadlines_for_ignored_course(monkeypatch, capsys):
+    module = load_horizon_module()
+    fixed_now = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+
+    def fake_fetch(path: str):
+        if path == "/health/details":
+            return {"details": {"stale_collectors": [], "source_auth_health": "healthy"}}
+        if path == "/courses":
+            return [{"id": 3, "display_name": "Mecánica de los Materiales"}]
+        if path == "/deadlines/upcoming":
+            return [{
+                "id": 214,
+                "course_id": 3,
+                "title": "Entrega TP Nº4",
+                "due_at": "2026-10-10T03:00:00Z",
+                "completion_state": "unknown",
+            }]
+        if path == "/risks":
+            return []
+        raise AssertionError(f"Unexpected path: {path}")
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+    setattr(module, "IGNORED_COURSE_IDS", {3})
+    monkeypatch.setattr(module, "fetch", fake_fetch)
+    monkeypatch.setattr(module, "datetime", FixedDateTime)
+
+    assert module.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["send_update"] is False
+    assert payload["deadline_count"] == 0
+    assert not any("TP Nº4" in line for line in payload["lines"])

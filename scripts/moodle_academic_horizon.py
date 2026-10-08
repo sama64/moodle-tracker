@@ -9,9 +9,14 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 API_BASE = os.environ.get("MOODLE_TRACKER_API", "http://localhost:8000")
+IGNORED_COURSE_IDS = {
+    int(value.strip())
+    for value in os.environ.get("MOODLE_IGNORED_COURSE_IDS", "").split(",")
+    if value.strip().isdigit()
+}
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 HORIZON_DAYS = int(os.environ.get("MOODLE_HORIZON_DAYS", "14"))
-EXAM_WORDS = ("parcial", "recuperatorio", "examen")
+EXAM_RE = re.compile(r"\b(?:parcial|recuperatorio|examen)\b", re.I)
 SCHEDULE_TITLE_WORDS = ("cronograma", "calendario", "horario", "fechas")
 DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?(?:\s*(?:de\s*)?(\d{1,2})[:.](\d{2}))?", re.I)
 
@@ -66,23 +71,22 @@ def extract_schedule_events(risks: list[dict], now: datetime, horizon_end: datet
         if not looks_like_schedule_doc(item):
             continue
         text = schedule_text(item)
-        if not any(word in text.lower() for word in EXAM_WORDS):
+        if not EXAM_RE.search(text):
             continue
         for match in DATE_RE.finditer(text):
             start = max(match.start() - 45, 0)
             end = min(match.end() + 55, len(text))
             context = text[start:end]
             lowered_context = context.lower()
-            if not any(word in lowered_context for word in EXAM_WORDS):
+            if not EXAM_RE.search(lowered_context):
                 continue
             # Avoid matching neighboring class/consultation dates just because an exam
             # appears later in the same dense schedule row.
             before = text[max(match.start() - 35, 0):match.start()].lower()
             after = text[match.end():min(match.end() + 45, len(text))].lower()
-            if not any(word in after for word in EXAM_WORDS):
+            if not EXAM_RE.search(after):
                 continue
-            after_lower = after.lower()
-            exam_positions = [after_lower.find(word) for word in EXAM_WORDS if word in after_lower]
+            exam_positions = [exam_match.start() for exam_match in EXAM_RE.finditer(after)]
             if exam_positions:
                 before_exam_word = after[:min(exam_positions)]
                 if DATE_RE.search(before_exam_word):
@@ -126,6 +130,8 @@ def main() -> int:
 
     upcoming_deadlines = []
     for item in deadlines:
+        if item.get("course_id") in IGNORED_COURSE_IDS:
+            continue
         if item.get("completion_state") == "completed":
             continue
         due = parse_dt(item.get("due_at"))
@@ -133,7 +139,8 @@ def main() -> int:
             upcoming_deadlines.append(item)
     upcoming_deadlines.sort(key=lambda i: (i.get("due_at") or "", i.get("id") or 0))
 
-    schedule_events = extract_schedule_events(risks, now, horizon_end)
+    active_risks = [risk for risk in risks if risk.get("course_id") not in IGNORED_COURSE_IDS]
+    schedule_events = extract_schedule_events(active_risks, now, horizon_end)
 
     lines = []
     if health.get("details", {}).get("stale_collectors") or health.get("details", {}).get("source_auth_health") != "healthy":
