@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sys
@@ -81,10 +82,14 @@ NON_USER_BLOCKING_STALE_COLLECTORS = {'moodle_files', 'moodle_grades'}
 NON_COURSE_ANNOUNCEMENT_COURSE_KEYWORDS = (
     'red de estudiantes', 'centro de estudiantes', 'bienestar', 'becas',
 )
-NON_COURSE_ANNOUNCEMENT_KEYWORDS = (
-    'elecciones', 'premio', 'pre ingeniería', 'pre ingenieria',
-    'beca', 'becas', 'convocatoria', 'invest your talent',
-    'aulas examenes finales', 'aulas exámenes finales',
+NON_COURSE_HIGH_VALUE_KEYWORDS = (
+    'mesa de examen', 'mesas de examen', 'mesa de exámenes', 'mesas de exámenes',
+    'finales regulares', 'finales libres', 'reprogramación mesas', 'reprogramacion mesas',
+    'calendario académico', 'calendario academico', 'cronograma académico', 'cronograma academico',
+    'inicio de clases', 'inicio del ciclo', 'comienzo de clases',
+    'inscripción a materias', 'inscripcion a materias',
+    'inscripción a finales', 'inscripcion a finales',
+    'aulas primer cuatrimestre', 'aulas segundo cuatrimestre',
 )
 
 
@@ -427,7 +432,21 @@ def is_non_course_announcement(item: dict, course_map: dict[int, str]) -> bool:
     blob = _text_blob(item)
     if not any(keyword in course for keyword in NON_COURSE_ANNOUNCEMENT_COURSE_KEYWORDS):
         return False
-    return any(keyword in title or keyword in blob for keyword in NON_COURSE_ANNOUNCEMENT_KEYWORDS)
+    return not any(keyword in title or keyword in blob for keyword in NON_COURSE_HIGH_VALUE_KEYWORDS)
+
+
+def alert_fingerprint(item: dict) -> str:
+    payload = {
+        'course_id': item.get('course_id'),
+        'item_type': item.get('item_type'),
+        'title': ' '.join(str(item.get('title') or '').lower().split()),
+        'body_text': ' '.join(str(item.get('body_text') or '').lower().split()),
+        'starts_at': item.get('starts_at'),
+        'due_at': item.get('due_at'),
+        'primary_url': item.get('primary_url'),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def is_actionable_change(item: dict, now_utc: datetime, course_map: dict[int, str]) -> bool:
@@ -545,6 +564,21 @@ def main() -> int:
         if prev is None or (item.get('updated_at') or '') > (prev.get('updated_at') or ''):
             deduped[key] = item
     meaningful = sorted(deduped.values(), key=lambda x: (x.get('updated_at') or '', x.get('id') or 0))
+
+    alert_history_path = STATE_DIR / 'moodle_tracker_alert_history.json'
+    alert_history = load_json_state(alert_history_path)
+    unsent_meaningful = []
+    for item in meaningful:
+        fingerprint = alert_fingerprint(item)
+        if fingerprint in alert_history:
+            low_priority_count += 1
+            continue
+        unsent_meaningful.append(item)
+        alert_history[fingerprint] = now_utc.isoformat().replace('+00:00', 'Z')
+    meaningful = unsent_meaningful
+    # Keep bounded durable dedupe state; insertion order preserves recency.
+    alert_history = dict(list(alert_history.items())[-500:])
+    save_json_state(alert_history_path, alert_history)
 
     latest_seen = since
     for item in changes:

@@ -322,6 +322,45 @@ def test_main_suppresses_non_course_beca_announcement(tmp_path, capsys):
     assert payload["lines"] == []
 
 
+def test_red_estudiantes_keeps_high_value_final_tables_but_suppresses_noise():
+    module = load_watch_module()
+    course_map = {1: "Red de Estudiantes FI-UNLZ 2026"}
+    finals = {
+        "course_id": 1,
+        "item_type": "announcement",
+        "title": "Mesas exámenes finales regulares-libres mes de octubre",
+        "body_text": "Remitimos las aulas de los exámenes finales regulares y libres.",
+    }
+    certification = {
+        "course_id": 1,
+        "item_type": "announcement",
+        "title": "Importante: Certificación título universitario",
+        "body_text": "Aviso para ingresantes del año 2026.",
+    }
+
+    assert module.is_non_course_announcement(finals, course_map) is False
+    assert module.is_non_course_announcement(certification, course_map) is True
+
+
+def test_alert_fingerprint_ignores_tracker_ids_and_refresh_timestamps():
+    module = load_watch_module()
+    first = {
+        "id": 228,
+        "course_id": 1,
+        "item_type": "announcement",
+        "title": "Mesas exámenes finales regulares-libres mes de octubre",
+        "body_text": "Remitimos las aulas de los exámenes finales.",
+        "updated_at": "2026-10-03T13:43:44Z",
+    }
+    refreshed_copy = {
+        **first,
+        "id": 999,
+        "updated_at": "2026-10-09T22:56:47Z",
+    }
+
+    assert module.alert_fingerprint(first) == module.alert_fingerprint(refreshed_copy)
+
+
 def test_main_advances_cursor_past_equal_timestamp_results(tmp_path, capsys):
     module = load_watch_module()
 
